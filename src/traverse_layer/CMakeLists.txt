@@ -66,6 +66,17 @@ include_directories(
     ${EIGEN3_INCLUDE_DIRS}
 )
 
+# Local ZigMaps build
+set(ZIGMAPS_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../zig/zig-out")
+
+add_library(zigmaps SHARED IMPORTED)
+
+set_target_properties(zigmaps PROPERTIES
+    IMPORTED_LOCATION "${ZIGMAPS_DIR}/lib/libzigmaps.so"
+    INTERFACE_INCLUDE_DIRECTORIES "${ZIGMAPS_DIR}/include"
+)
+
 # TraverseLayer
 add_library(
     traverse_layer_component SHARED
@@ -124,6 +135,15 @@ install(
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin
+)
+
+install(
+    FILES "${ZIGMAPS_DIR}/lib/libzigmaps.so"
+    DESTINATION lib
+)
+
+set_target_properties(traverse_layer_component PROPERTIES
+    INSTALL_RPATH "$ORIGIN"
 )
 
 # Mark other files for installation
