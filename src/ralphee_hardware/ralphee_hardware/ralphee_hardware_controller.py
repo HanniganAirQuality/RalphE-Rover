@@ -7,7 +7,6 @@ from ralphee_hardware.ralphee_servo_interface import init_servos, update_servos
 
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Float64MultiArray, Int16
-from ralphee_remote_control.ralphee_remote_control import Controller
 
 WHEEL_BASE = 1.0
 TRACK_WIDTH = 1.0
@@ -78,19 +77,38 @@ class RalpheeHardwareController(Node):
         super().__init__('ralphee_hardware_controller')
         self.cmd_vel_sub = self.create_subscription(Twist, 'cmd_vel', self.nav2_listener_callback, 10)
         self.controller_sub = self.create_subscription(Float64MultiArray, 'angle_vel_controller', self.controller_angle_vel_listener_callback, 10)
-        self.controller_sub = self.create_subscription(Int16, 'state', self.controller_angle_vel_listener_callback, 10)
+        self.state_sub = self.create_subscription(Int16, 'state', self.controller_state_listener_callback, 10)
         self.state = 1
 
         self.get_logger().info(f'Initializing Hardware!')
 
-        loop = asyncio.get_event_loop() # Runs async function in non async function!
-
-        tasks = init_motors(), init_servos()
-        self.motors, self.arduino = loop.run_until_complete(asyncio.gather(*tasks))
-
-        loop.close()
+        self._loop = asyncio.new_event_loop()
+        try:
+            self.motors, self.arduino = self._loop.run_until_complete(self._initialize_hardware())
+        except BaseException:
+            self.destroy_node()
+            raise
 
         self.get_logger().info(f'Initialized Hardware!')
+
+    async def _initialize_hardware(self):
+        return await asyncio.gather(init_motors(), init_servos())
+
+    async def _update_hardware(self, velocity, angle, radius):
+        await asyncio.gather(
+            update_motors(velocity, radius, self.motors),
+            update_servos(angle, self.arduino)
+        )
+
+    def destroy_node(self):
+        if not self._loop.is_closed():
+            pending = asyncio.all_tasks(self._loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            self._loop.close()
+        return super().destroy_node()
 
     def nav2_listener_callback(self, msg: Twist):
         """
@@ -109,15 +127,9 @@ class RalpheeHardwareController(Node):
 
         self.get_logger().info(f'Updating motors and servos!')
 
-        loop = asyncio.get_event_loop() # Runs async function in non async function!
-
-        tasks = (
-            update_motors(velocity, inner_angle_n1_to_1, radius, self.motors), 
-            update_servos(inner_angle_n1_to_1, self.motors)
+        self._loop.run_until_complete(
+            self._update_hardware(velocity, inner_angle_n1_to_1, radius)
         )
-        self.motors, self.arduino = loop.run_until_complete(asyncio.gather(*tasks))
-
-        loop.close()
 
         self.get_logger().info(f'Updated motors and servos!')
 
@@ -130,22 +142,18 @@ class RalpheeHardwareController(Node):
     def controller_angle_vel_listener_callback(self, msg: Float64MultiArray):
         if self.state != 1:
             return
-        vel = msg[0]
-        angle = msg[1]
+        if len(msg.data) < 2:
+            self.get_logger().warning('Ignoring controller command: expected velocity and angle.')
+            return
+        vel = msg.data[0]
+        angle = msg.data[1]
+        if not math.isfinite(vel) or not math.isfinite(angle):
+            self.get_logger().warning('Ignoring controller command: velocity and angle must be finite.')
+            return
 
-        radius = get_radius(radius)
+        radius = get_radius(angle)
 
-        loop = asyncio.get_event_loop() # Runs async function in non async function!
-
-        tasks = (
-            update_motors(vel, angle, radius, self.motors), 
-            update_servos(vel, self.motors)
-        )
-        self.motors, self.arduino = loop.run_until_complete(asyncio.gather(*tasks))
-
-        loop.close()
-
-        
+        self._loop.run_until_complete(self._update_hardware(vel, angle, radius))
 
 def main(args=None):
     """
@@ -153,15 +161,14 @@ def main(args=None):
     """
     rclpy.init(args=args)
 
-    ralphee_hardware_controller = RalpheeHardwareController()
-
-    rclpy.spin(ralphee_hardware_controller)
-
-    # Destroy the node explicitly
-    # (optional - otherwise it will be done automatically
-    # when the garbage collector destroys the node object)
-    ralphee_hardware_controller.destroy_node()
-    rclpy.shutdown()
+    ralphee_hardware_controller = None
+    try:
+        ralphee_hardware_controller = RalpheeHardwareController()
+        rclpy.spin(ralphee_hardware_controller)
+    finally:
+        if ralphee_hardware_controller is not None:
+            ralphee_hardware_controller.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
