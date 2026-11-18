@@ -24,8 +24,11 @@ def lerp_angle(angle: float) -> float:
     translated_angle = (clamped_angle + 1.0)/2.0
     return MIN_ANGLE + translated_angle*(MAX_ANGLE-MIN_ANGLE)
 
-def get_radius(angle) -> tuple[float, float]:
+def get_radius(angle) -> float:
     global WHEEL_BASE, TRACK_WIDTH
+
+    if angle == 0:
+        return math.inf
 
     angle_interpolated = lerp_angle(angle)
     denominator = math.tan(angle_interpolated)
@@ -50,11 +53,17 @@ def convert_trans_rot_vel_to_radius_and_inner_angle(
     """
     global WHEEL_BASE, TRACK_WIDTH
 
-    if angular_velocity == 0 or velocity == 0:
-        return 0
+    if not math.isfinite(velocity) or not math.isfinite(angular_velocity):
+        raise ValueError('Velocity and angular velocity must be finite.')
+    if angular_velocity == 0:
+        return math.inf, math.pi / 2
+    if velocity == 0:
+        raise ValueError('In-place rotation is unsupported.')
 
     # Velocity is absolute since the sign of radius is used to determine which side of the rover its on.
     radius = velocity / angular_velocity
+    if not math.isfinite(radius) or radius == 0 or radius == TRACK_WIDTH / 2:
+        raise ValueError('Invalid or singular turning radius.')
     return radius, math.atan(WHEEL_BASE / (radius - TRACK_WIDTH/2))
 
 def inverse_lerp_angle(angle: float) -> float:
@@ -100,6 +109,10 @@ class RalpheeHardwareController(Node):
             update_servos(angle, self.arduino)
         )
 
+    def _request_stop(self, reason):
+        self.get_logger().warning(f'{reason} Requesting zero velocity and centered steering.')
+        self._loop.run_until_complete(self._update_hardware(0.0, 0.0, math.inf))
+
     def destroy_node(self):
         if not self._loop.is_closed():
             pending = asyncio.all_tasks(self._loop)
@@ -121,9 +134,14 @@ class RalpheeHardwareController(Node):
             return
         velocity: float = msg.linear.x
         angular_velocity: float = msg.angular.z
-        radius, inner_angle = convert_trans_rot_vel_to_radius_and_inner_angle(velocity, angular_velocity)
+        try:
+            radius, inner_angle = convert_trans_rot_vel_to_radius_and_inner_angle(velocity, angular_velocity)
+        except ValueError as error:
+            self._request_stop(f'Invalid Nav2 command: {error}')
+            return
 
-        inner_angle_n1_to_1 = inverse_lerp_angle(inner_angle)
+        # Centered steering is already normalized; only convert curved commands.
+        inner_angle_n1_to_1 = 0.0 if angular_velocity == 0 else inverse_lerp_angle(inner_angle)
 
         self.get_logger().info(f'Updating motors and servos!')
 
@@ -143,15 +161,18 @@ class RalpheeHardwareController(Node):
         if self.state != 1:
             return
         if len(msg.data) < 2:
-            self.get_logger().warning('Ignoring controller command: expected velocity and angle.')
+            self._request_stop('Invalid controller command: expected velocity and angle.')
             return
         vel = msg.data[0]
         angle = msg.data[1]
         if not math.isfinite(vel) or not math.isfinite(angle):
-            self.get_logger().warning('Ignoring controller command: velocity and angle must be finite.')
+            self._request_stop('Invalid controller command: velocity and angle must be finite.')
             return
 
         radius = get_radius(angle)
+        if radius == 0 or (not math.isfinite(radius) and radius != math.inf):
+            self._request_stop('Invalid controller command: invalid or singular turning radius.')
+            return
 
         self._loop.run_until_complete(self._update_hardware(vel, angle, radius))
 

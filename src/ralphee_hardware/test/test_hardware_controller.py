@@ -1,4 +1,4 @@
-"""Stage 1 callback checks using only fake ROS and hardware modules."""
+"""Callback and command-conversion checks using only fake ROS and hardware modules."""
 
 import asyncio
 import importlib.util
@@ -52,10 +52,14 @@ class TestHardwareController(unittest.TestCase):
             return self.arduino
 
         async def update_motors(velocity, radius, controller_groups):
+            self.assertTrue(math.isfinite(velocity))
+            # Positive infinity is the interface's intentional straight-line sentinel.
+            self.assertTrue(radius == math.inf or (math.isfinite(radius) and radius != 0))
             self.loops.append(asyncio.get_running_loop())
             self.motor_updates.append((velocity, radius, controller_groups))
 
         async def update_servos(angle, arduino):
+            self.assertTrue(math.isfinite(angle))
             self.loops.append(asyncio.get_running_loop())
             self.servo_updates.append((angle, arduino))
 
@@ -86,7 +90,7 @@ class TestHardwareController(unittest.TestCase):
 
         source = Path(__file__).resolve().parents[1] / 'ralphee_hardware'
         spec = importlib.util.spec_from_file_location(
-            'stage1_controller_under_test', source / 'ralphee_hardware_controller.py')
+            'controller_under_test', source / 'ralphee_hardware_controller.py')
         self.module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.module)
         self.node = self.module.RalpheeHardwareController()
@@ -123,16 +127,80 @@ class TestHardwareController(unittest.TestCase):
         self.assertIs(self.node.arduino, self.arduino)
         self.assertTrue(all(loop is self.loops[0] for loop in self.loops))
 
-    def test_incomplete_or_nonfinite_manual_commands_do_not_update_hardware(self):
+    def assert_last_centered_command(self, velocity):
+        self.assertEqual(self.motor_updates[-1], (velocity, math.inf, self.motors))
+        self.assertEqual(self.servo_updates[-1], (0.0, self.arduino))
+        self.assertTrue(math.isfinite(self.motor_updates[-1][0]))
+        self.assertTrue(math.isfinite(self.servo_updates[-1][0]))
+
+    def test_invalid_manual_commands_request_stop_and_recover(self):
         commands = ([], [0.4], [math.nan, 0.1], [0.4, math.inf],
                     [-math.inf, 0.1], [0.4, math.nan])
-        with patch.object(self.module, 'get_radius') as get_radius:
-            for data in commands:
-                with self.subTest(data=data):
+        for data in commands:
+            with self.subTest(data=data):
+                self.node.controller_angle_vel_listener_callback(SimpleNamespace(data=[0.4, 0.25]))
+                self.assertEqual(self.motor_updates[-1][0], 0.4)
+                with patch.object(self.module, 'get_radius') as get_radius:
                     self.node.controller_angle_vel_listener_callback(SimpleNamespace(data=data))
-            get_radius.assert_not_called()
-        self.assertEqual(self.motor_updates, [])
-        self.assertEqual(self.servo_updates, [])
+                    get_radius.assert_not_called()
+                self.assert_last_centered_command(0.0)
+                self.node.controller_angle_vel_listener_callback(SimpleNamespace(data=[-0.3, 0.0]))
+                self.assert_last_centered_command(-0.3)
+
+    def test_invalid_manual_radius_requests_stop_and_recovers(self):
+        command = SimpleNamespace(data=[0.4, 0.25])
+        for radius in (0.0, math.nan, -math.inf):
+            with self.subTest(radius=radius):
+                self.node.controller_angle_vel_listener_callback(command)
+                with patch.object(self.module, 'get_radius', return_value=radius):
+                    self.node.controller_angle_vel_listener_callback(command)
+                self.assert_last_centered_command(0.0)
+                self.node.controller_angle_vel_listener_callback(command)
+                self.assertEqual(self.motor_updates[-1][0], 0.4)
+                self.assertEqual(self.servo_updates[-1], (0.25, self.arduino))
+
+    def test_manual_centered_commands_include_zero_and_reverse(self):
+        self.assertEqual(self.module.get_radius(0.0), math.inf)
+        for velocity in (0.0, 0.4, -0.4):
+            with self.subTest(velocity=velocity):
+                self.node.controller_angle_vel_listener_callback(
+                    SimpleNamespace(data=[velocity, 0.0]))
+                self.assert_last_centered_command(velocity)
+
+    def test_nav2_zero_and_straight_commands_bypass_angle_conversion(self):
+        self.node.controller_state_listener_callback(SimpleNamespace(data=2))
+        with patch.object(self.module, 'inverse_lerp_angle',
+                          side_effect=AssertionError('Centered steering must bypass angle conversion.')):
+            for velocity in (0.0, 0.4, -0.4):
+                with self.subTest(velocity=velocity):
+                    self.assertEqual(
+                        self.module.convert_trans_rot_vel_to_radius_and_inner_angle(velocity, 0.0),
+                        (math.inf, math.pi / 2))
+                    self.node.nav2_listener_callback(SimpleNamespace(
+                        linear=SimpleNamespace(x=velocity), angular=SimpleNamespace(z=0.0)))
+                    self.assert_last_centered_command(velocity)
+
+    def test_invalid_nav2_commands_request_stop_and_recover(self):
+        self.node.controller_state_listener_callback(SimpleNamespace(data=2))
+        commands = ((math.nan, 0.2), (0.4, math.nan), (math.inf, 0.2), (0.4, -math.inf),
+                    (0.0, 0.3), (0.0, -0.3), (0.5, 1.0), (-0.5, -1.0),
+                    (1e308, 1e-308), (1e-308, 1e308))
+        for velocity, angular_velocity in commands:
+            with self.subTest(velocity=velocity, angular_velocity=angular_velocity):
+                self.node.nav2_listener_callback(SimpleNamespace(
+                    linear=SimpleNamespace(x=0.4), angular=SimpleNamespace(z=0.0)))
+                self.assert_last_centered_command(0.4)
+                with patch.object(self.module, 'inverse_lerp_angle',
+                                  side_effect=AssertionError('Stop must bypass angle conversion.')):
+                    self.node.nav2_listener_callback(SimpleNamespace(
+                        linear=SimpleNamespace(x=velocity),
+                        angular=SimpleNamespace(z=angular_velocity)))
+                self.assert_last_centered_command(0.0)
+                self.node.nav2_listener_callback(SimpleNamespace(
+                    linear=SimpleNamespace(x=0.5), angular=SimpleNamespace(z=0.25)))
+                self.assertEqual(self.motor_updates[-1], (0.5, 2.0, self.motors))
+                # Preserve the existing curved-angle result; geometry is for Stage 3.
+                self.assertEqual(self.servo_updates[-1], (-1.0, self.arduino))
 
     def test_state_gates_commands_and_nav2_dispatch_uses_existing_conversion(self):
         command = SimpleNamespace(linear=SimpleNamespace(x=0.6), angular=SimpleNamespace(z=0.2))
