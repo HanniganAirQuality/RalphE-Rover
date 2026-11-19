@@ -65,6 +65,107 @@ class TestMotionGeometry(unittest.TestCase):
             self.geometry.front_to_middle_m + self.geometry.middle_to_rear_m, 0.680)
         self.assertEqual(self.geometry.nominal_wheel_radius_m, 0.125)
 
+    def test_normalized_steering_round_trip_includes_neutral_and_full_steering(self):
+        for degrees in (10, 30, 60):
+            reference = math.radians(degrees)  # Synthetic reference, not a calibration.
+            for steering in (-1.0, -0.75, -0.25, -1e-9, 0.0, 1e-9, 0.25, 0.75, 1.0):
+                with self.subTest(reference_degrees=degrees, steering=steering):
+                    curvature = self.motion.curvature_from_normalized_steering(
+                        steering, reference_angle_rad=reference, geometry=self.geometry)
+                    recovered = self.motion.normalized_steering_from_curvature(
+                        curvature, reference_angle_rad=reference, geometry=self.geometry)
+                    self.assertTrue(math.isfinite(curvature))
+                    self.assertTrue(math.isclose(recovered, steering, rel_tol=1e-12, abs_tol=1e-15))
+                    if steering == 0:
+                        self.assertEqual(curvature, 0.0)
+                        self.assertEqual(recovered, 0.0)
+                    else:
+                        self.assertGreater(curvature * steering, 0.0)
+
+    def test_curvature_round_trip_includes_positive_negative_and_endpoints(self):
+        for degrees in (10, 30, 60):
+            reference = math.radians(degrees)
+            maximum = self.motion.curvature_from_normalized_steering(
+                1.0, reference_angle_rad=reference, geometry=self.geometry)
+            for fraction in (-1.0, -0.5, -1e-9, 0.0, 1e-9, 0.5, 1.0):
+                with self.subTest(reference_degrees=degrees, fraction=fraction):
+                    curvature = fraction * maximum
+                    steering = self.motion.normalized_steering_from_curvature(
+                        curvature, reference_angle_rad=reference, geometry=self.geometry)
+                    recovered = self.motion.curvature_from_normalized_steering(
+                        steering, reference_angle_rad=reference, geometry=self.geometry)
+                    self.assertTrue(math.isclose(recovered, curvature, rel_tol=1e-12, abs_tol=1e-15))
+                    if abs(fraction) == 1:
+                        self.assertEqual(steering, fraction)
+
+    def test_normalized_steering_matches_the_front_inner_wheel_heading(self):
+        # The second geometry is synthetic and checks that the supplied dimensions are used.
+        geometries = (self.geometry, self.motion.Geometry(
+            front_to_middle_m=0.400, middle_to_rear_m=0.250, track_width_m=0.600))
+        reference = self.test_angle_limit
+        for geometry in geometries:
+            for steering in (-1.0, -0.5, -1e-6, 0.0, 1e-6, 0.5, 1.0):
+                with self.subTest(geometry=geometry, steering=steering):
+                    curvature = self.motion.curvature_from_normalized_steering(
+                        steering, reference_angle_rad=reference, geometry=geometry)
+                    solution = self.motion.solve_curvature(
+                        0.5, curvature, geometry=geometry, steering_limits_rad=self.limits)
+                    inner = 'front_left' if steering >= 0 else 'front_right'
+                    self.assertAlmostEqual(
+                        solution[inner].steering_angle_rad, steering * reference, places=12)
+
+    def test_steering_conversions_reject_requests_outside_their_ranges(self):
+        reference = self.test_angle_limit
+        maximum = self.motion.curvature_from_normalized_steering(
+            1.0, reference_angle_rad=reference, geometry=self.geometry)
+        for steering in (-2.0, -math.nextafter(1.0, math.inf),
+                         math.nextafter(1.0, math.inf), 2.0):
+            with self.subTest(steering=steering):
+                with self.assertRaises(ValueError):
+                    self.motion.curvature_from_normalized_steering(
+                        steering, reference_angle_rad=reference, geometry=self.geometry)
+        for curvature in (-math.nextafter(maximum, math.inf),
+                          math.nextafter(maximum, math.inf), -4.0, 4.0):
+            with self.subTest(curvature=curvature):
+                with self.assertRaises(ValueError):
+                    self.motion.normalized_steering_from_curvature(
+                        curvature, reference_angle_rad=reference, geometry=self.geometry)
+
+    def test_steering_conversions_require_a_valid_explicit_reference_angle(self):
+        functions = (self.motion.curvature_from_normalized_steering,
+                     self.motion.normalized_steering_from_curvature)
+        for convert in functions:
+            with self.assertRaises(TypeError):
+                convert(0.0, geometry=self.geometry)
+            for reference in (0.0, -0.1, math.pi / 2, math.pi, math.nan,
+                              math.inf, -math.inf, None, '0.5', True):
+                with self.subTest(function=convert.__name__, reference=reference):
+                    with self.assertRaises(ValueError):
+                        convert(0.0, reference_angle_rad=reference, geometry=self.geometry)
+
+    def test_steering_conversions_reject_invalid_inputs_and_geometry(self):
+        functions = (self.motion.curvature_from_normalized_steering,
+                     self.motion.normalized_steering_from_curvature)
+        for convert in functions:
+            for value in (math.nan, math.inf, -math.inf, None, '0.5', True):
+                with self.subTest(function=convert.__name__, value=value):
+                    with self.assertRaises(ValueError):
+                        convert(value, reference_angle_rad=self.test_angle_limit,
+                                geometry=self.geometry)
+            with self.assertRaises(ValueError):
+                convert(0.0, reference_angle_rad=self.test_angle_limit, geometry=None)
+
+    def test_unrepresentable_steering_conversions_raise_value_error(self):
+        with self.assertRaises(ValueError):
+            self.motion.curvature_from_normalized_steering(
+                0.25, reference_angle_rad=math.ulp(0.0), geometry=self.geometry)
+        geometry = self.motion.Geometry(
+            front_to_middle_m=sys.float_info.max, track_width_m=sys.float_info.max)
+        for convert in (self.motion.curvature_from_normalized_steering,
+                        self.motion.normalized_steering_from_curvature):
+            with self.assertRaises(ValueError):
+                convert(1.0, reference_angle_rad=math.pi / 4, geometry=geometry)
+
     def test_straight_forward_and_reverse(self):
         for velocity in (0.5, -0.5):
             for solve in (self.solve_twist, self.solve_curvature):

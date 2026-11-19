@@ -72,6 +72,80 @@ class WheelMotion:
     linear_velocity_mps: float
 
 
+def curvature_from_normalized_steering(
+    normalized_steering: float,
+    *,
+    reference_angle_rad: float,
+    geometry: Geometry,
+) -> float:
+    """Convert steering in [-1, 1] to signed curvature in inverse metres.
+
+    Zero is straight; positive is left in ROS coordinates. The explicitly
+    supplied reference angle is the front-inner wheel-heading magnitude at
+    full steering, strictly between zero and pi/2. For angle = steering*reference,
+    curvature = sin(angle)/(front_distance*cos(angle) + half_track*abs(sin(angle))).
+
+    Invalid or unrepresentable requests raise ValueError. Check all four
+    physical wheel-angle limits separately with solve_curvature().
+    """
+    steering = _finite_float(normalized_steering, 'Normalized steering')
+    reference = _finite_float(reference_angle_rad, 'Steering reference angle')
+    if not isinstance(geometry, Geometry):
+        raise ValueError('geometry must be a Geometry instance.')
+    if not 0 < reference < math.pi / 2:
+        raise ValueError('Steering reference angle must lie strictly between zero and pi/2.')
+    if abs(steering) > 1:
+        raise ValueError('Normalized steering must lie in [-1, 1].')
+    if steering == 0:
+        return 0.0
+
+    angle = steering * reference
+    sine = math.sin(angle)
+    denominator = (geometry.front_to_middle_m * math.cos(angle)
+                   + geometry.track_width_m / 2 * abs(sine))
+    if not math.isfinite(denominator) or denominator <= 0:
+        raise ValueError('Steering curvature calculation is unrepresentable.')
+    curvature = sine / denominator
+    if (not math.isfinite(curvature) or curvature == 0
+            or abs(curvature) >= 2.0 / geometry.track_width_m):
+        raise ValueError('Steering curvature is unrepresentable outside the wheel tracks.')
+    return curvature
+
+
+def normalized_steering_from_curvature(
+    curvature_inv_m: float,
+    *,
+    reference_angle_rad: float,
+    geometry: Geometry,
+) -> float:
+    """Invert curvature_from_normalized_steering() within its supported range.
+
+    The supported curvature interval is bounded by normalized steering +/-1
+    with the same geometry and explicit reference angle. Positive is left;
+    zero returns exactly zero. Out-of-range requests raise ValueError.
+    """
+    curvature = _finite_float(curvature_inv_m, 'Curvature')
+    reference = _finite_float(reference_angle_rad, 'Steering reference angle')
+    maximum = curvature_from_normalized_steering(
+        1.0, reference_angle_rad=reference, geometry=geometry)
+    if abs(curvature) > maximum:
+        raise ValueError('Curvature exceeds the normalized steering range.')
+    if curvature == 0:
+        return 0.0
+    # Return exact normalized endpoints after validating the curvature range.
+    if abs(curvature) == maximum:
+        return math.copysign(1.0, curvature)
+
+    longitudinal = 1.0 - geometry.track_width_m / 2 * abs(curvature)
+    lateral = geometry.front_to_middle_m * curvature
+    if longitudinal <= 0 or not math.isfinite(lateral):
+        raise ValueError('Steering angle calculation is unrepresentable.')
+    steering = math.atan2(lateral, longitudinal) / reference
+    if not math.isfinite(steering) or steering == 0 or abs(steering) > 1:
+        raise ValueError('Normalized steering calculation is unrepresentable.')
+    return steering
+
+
 def _validated_limits(
     limits: Mapping[str, tuple[float, float]],
 ) -> dict[str, tuple[float, float]]:
