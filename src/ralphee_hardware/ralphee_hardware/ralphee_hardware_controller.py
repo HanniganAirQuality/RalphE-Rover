@@ -1,120 +1,122 @@
-import rclpy
-import math
-import asyncio
-from rclpy.node import Node
-from ralphee_hardware.ralphee_motor_interface import init_motors, update_motors
-from ralphee_hardware.ralphee_servo_interface import init_servos, update_servos
+"""Manual ROS control using the shared wheel geometry.
 
+Parameters are read at startup. Hardware output defaults off; no device module
+is imported in that mode. Reference angle and output-rps limit default to zero
+(unconfigured). Set explicit values for calculation-only use, and verify physical
+calibration, stale-input stopping and the motor watchdog before enabling output.
+"""
+
+import asyncio
+import math
+
+import rclpy
+from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from std_msgs.msg import Float64MultiArray, Int16
 
-WHEEL_BASE = 1.0
-TRACK_WIDTH = 1.0
+from ralphee_hardware.motion_geometry import (
+    MEASURED_GEOMETRY,
+    curvature_from_normalized_steering,
+    solve_curvature,
+)
 
-MAX_ANGLE = 0.75 * math.pi
-MIN_ANGLE = 0.25 * math.pi
-
-def lerp_angle(angle: float) -> float:
-    """
-        Translates angle to 1, -1
-    """
-    global MIN_ANGLE, MAX_ANGLE
-
-    clamped_angle = max(min(angle, 1), -1)
-    translated_angle = (clamped_angle + 1.0)/2.0
-    return MIN_ANGLE + translated_angle*(MAX_ANGLE-MIN_ANGLE)
-
-def get_radius(angle) -> float:
-    global WHEEL_BASE, TRACK_WIDTH
-
-    if angle == 0:
-        return math.inf
-
-    angle_interpolated = lerp_angle(angle)
-    denominator = math.tan(angle_interpolated)
-    offset = TRACK_WIDTH/2 if angle >= 0 else -TRACK_WIDTH/2
-    if denominator != 0:
-        radius = (WHEEL_BASE/denominator) + offset
-    else:
-        radius = math.inf
-    return radius
-
-def convert_trans_rot_vel_to_radius_and_inner_angle(
-    velocity: float, angular_velocity: float) -> tuple[float, float]:
-    """ 
-        Converts velocity and angular velocity into radius of turn and the steering angle of the turn.
-        Args:
-            velocity:
-                x component of cmd_vel.linear
-            angular_velocity:
-                z comoponent of cmd_vel.angular
-        Returns:
-            (radius, steering_angle) 
-    """
-    global WHEEL_BASE, TRACK_WIDTH
-
-    if not math.isfinite(velocity) or not math.isfinite(angular_velocity):
-        raise ValueError('Velocity and angular velocity must be finite.')
-    if angular_velocity == 0:
-        return math.inf, math.pi / 2
-    if velocity == 0:
-        raise ValueError('In-place rotation is unsupported.')
-
-    # Velocity is absolute since the sign of radius is used to determine which side of the rover its on.
-    radius = velocity / angular_velocity
-    if not math.isfinite(radius) or radius == 0 or radius == TRACK_WIDTH / 2:
-        raise ValueError('Invalid or singular turning radius.')
-    return radius, math.atan(WHEEL_BASE / (radius - TRACK_WIDTH/2))
-
-def inverse_lerp_angle(angle: float) -> float:
-    """
-        Translates angle to angle between -1 and 1
-    """
-    global MIN_ANGLE, MAX_ANGLE
-
-    clamped_angle = max(min(angle, MAX_ANGLE), MIN_ANGLE)
-    return (2.0*(clamped_angle - MIN_ANGLE)/(MAX_ANGLE - MIN_ANGLE)) - 1.0
 
 class RalpheeHardwareController(Node):
-    """
-        Class that subscribes to 'cmd_vel' topic, retreives angle and velocity from twist object, and sends it to hardware.
-    """
+    """Keep manual [base output-rps, normalized steering] commands separate from I/O."""
+
     def __init__(self):
-        """ 
-            Constructs RalpheeHardwareController class
-        """
         super().__init__('ralphee_hardware_controller')
-        self.cmd_vel_sub = self.create_subscription(Twist, 'cmd_vel', self.nav2_listener_callback, 10)
-        self.controller_sub = self.create_subscription(Float64MultiArray, 'angle_vel_controller', self.controller_angle_vel_listener_callback, 10)
-        self.state_sub = self.create_subscription(Int16, 'state', self.controller_state_listener_callback, 10)
+        self.hardware_output_enabled = self.declare_parameter(
+            'hardware_output_enabled', False).value
+        self.steering_reference_angle_rad = self.declare_parameter(
+            'steering_reference_angle_rad', 0.0).value
+        self.max_output_rps = self.declare_parameter('max_output_rps', 0.0).value
         self.state = 1
+        self.cmd_vel_sub = self.create_subscription(
+            Twist, 'cmd_vel', self.nav2_listener_callback, 10)
+        self.controller_sub = self.create_subscription(
+            Float64MultiArray, 'angle_vel_controller',
+            self.controller_angle_vel_listener_callback, 10)
+        self.state_sub = self.create_subscription(
+            Int16, 'state', self.controller_state_listener_callback, 10)
 
-        self.get_logger().info(f'Initializing Hardware!')
-
+        self._wheel_circumference_m = math.tau * MEASURED_GEOMETRY.nominal_wheel_radius_m
+        self._zero_velocities_mps = {
+            name: 0.0 for name in MEASURED_GEOMETRY.wheel_positions_m}
+        self.motors = self.arduino = None
         self._loop = asyncio.new_event_loop()
         try:
-            self.motors, self.arduino = self._loop.run_until_complete(self._initialize_hardware())
+            if self.hardware_output_enabled:
+                self._validate_motion_settings()
+                # These imports and all device initialization are inside the output gate.
+                from ralphee_hardware.ralphee_motor_interface import (
+                    init_motors, update_wheel_velocities)
+                from ralphee_hardware.ralphee_servo_interface import init_servos, update_servos
+                self._init_motors = init_motors
+                self._init_servos = init_servos
+                self._update_wheel_velocities = update_wheel_velocities
+                self._update_servos = update_servos
+                self.motors, self.arduino = self._loop.run_until_complete(
+                    self._initialize_hardware())
+                self.get_logger().info('Initialized hardware; manual control only.')
+            else:
+                self.get_logger().info(
+                    'Hardware output disabled: calculating and logging commands only.')
+                if self.steering_reference_angle_rad == 0.0 or self.max_output_rps == 0.0:
+                    self.get_logger().warning(
+                        'Set steering_reference_angle_rad and max_output_rps explicitly '
+                        'to calculate nonzero manual commands. Zero means unconfigured.')
         except BaseException:
             self.destroy_node()
             raise
 
-        self.get_logger().info(f'Initialized Hardware!')
+    def _validate_motion_settings(self):
+        if (not math.isfinite(self.steering_reference_angle_rad)
+                or not 0 < self.steering_reference_angle_rad < math.pi / 2):
+            raise ValueError('steering_reference_angle_rad must be finite and between 0 and pi/2.')
+        if not math.isfinite(self.max_output_rps) or self.max_output_rps <= 0:
+            raise ValueError('max_output_rps must be finite and positive.')
 
     async def _initialize_hardware(self):
-        return await asyncio.gather(init_motors(), init_servos())
+        return await asyncio.gather(self._init_motors(), self._init_servos())
 
-    async def _update_hardware(self, velocity, angle, radius):
-        await asyncio.gather(
-            update_motors(velocity, radius, self.motors),
-            update_servos(angle, self.arduino)
-        )
+    async def _update_hardware(self, wheel_velocities_mps, steering):
+        # Finish both operations before handling an error or issuing a later stop.
+        results = await asyncio.gather(
+            self._update_wheel_velocities(
+                wheel_velocities_mps, self.motors, max_output_rps=self.max_output_rps),
+            self._update_servos(steering, self.arduino),
+            return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    def _dispatch_command(self, wheel_velocities_mps, steering):
+        # Check final wheel speeds in calculation mode too, before either output.
+        for velocity_mps in wheel_velocities_mps.values():
+            if (not math.isfinite(velocity_mps)
+                    or (velocity_mps != 0.0
+                        and abs(velocity_mps) / self._wheel_circumference_m > self.max_output_rps)):
+                raise ValueError('Calculated wheel velocity exceeds max_output_rps or is nonfinite.')
+        self.get_logger().info(
+            f'Calculated wheel velocities (m/s): {wheel_velocities_mps}; '
+            f'Arduino normalized steering: {steering}')
+        if self.hardware_output_enabled:
+            self._loop.run_until_complete(
+                self._update_hardware(wheel_velocities_mps, steering))
 
     def _request_stop(self, reason):
-        self.get_logger().warning(f'{reason} Requesting zero velocity and centered steering.')
-        self._loop.run_until_complete(self._update_hardware(0.0, 0.0, math.inf))
+        self.get_logger().warning(f'{reason} Requesting six zero velocities and centered steering.')
+        try:
+            self._dispatch_command(self._zero_velocities_mps, 0.0)
+        except Exception as error:
+            # A failed request is not confirmation that the motors have stopped.
+            self.get_logger().error(f'Stop request failed: {error}')
 
     def destroy_node(self):
         if not self._loop.is_closed():
+            if self.hardware_output_enabled and self.motors is not None:
+                self._request_stop('Controller shutting down.')
             pending = asyncio.all_tasks(self._loop)
             for task in pending:
                 task.cancel()
@@ -124,71 +126,68 @@ class RalpheeHardwareController(Node):
         return super().destroy_node()
 
     def nav2_listener_callback(self, msg: Twist):
-        """
-            Receives velocity and angle and sends it to hardware!
-            Args:
-                msg:
-                    Twist object that comes with angle and velocity.
-        """
-        if self.state != 2:
-            return
-        velocity: float = msg.linear.x
-        angular_velocity: float = msg.angular.z
-        try:
-            radius, inner_angle = convert_trans_rot_vel_to_radius_and_inner_angle(velocity, angular_velocity)
-        except ValueError as error:
-            self._request_stop(f'Invalid Nav2 command: {error}')
-            return
-
-        # Centered steering is already normalized; only convert curved commands.
-        inner_angle_n1_to_1 = 0.0 if angular_velocity == 0 else inverse_lerp_angle(inner_angle)
-
-        self.get_logger().info(f'Updating motors and servos!')
-
-        self._loop.run_until_complete(
-            self._update_hardware(velocity, inner_angle_n1_to_1, radius)
-        )
-
-        self.get_logger().info(f'Updated motors and servos!')
+        """Nav2 cannot drive in this manual-only stage."""
+        if self.state == 2:
+            self._request_stop('Nav2 drive output is disabled.')
 
     def controller_state_listener_callback(self, msg: Int16):
-        if msg.data == 1:
-            self.state = 1
-        elif msg.data == 2:
-            self.state = 2
+        if msg.data not in (1, 2):
+            self._request_stop('Unknown control mode.')
+            return
+        if msg.data != self.state:
+            self.state = msg.data
+            self._request_stop('Control mode changed.')
 
     def controller_angle_vel_listener_callback(self, msg: Float64MultiArray):
         if self.state != 1:
             return
-        if len(msg.data) < 2:
-            self._request_stop('Invalid controller command: expected velocity and angle.')
-            return
-        vel = msg.data[0]
-        angle = msg.data[1]
-        if not math.isfinite(vel) or not math.isfinite(angle):
-            self._request_stop('Invalid controller command: velocity and angle must be finite.')
-            return
+        try:
+            if len(msg.data) != 2:
+                raise ValueError('Expected exactly [speed, steering].')
+            base_output_rps, steering = msg.data
+            if (isinstance(base_output_rps, bool) or isinstance(steering, bool)
+                    or not math.isfinite(base_output_rps) or not math.isfinite(steering)):
+                raise ValueError('Speed and steering must be finite numbers.')
+            if not -1.0 <= steering <= 1.0:
+                raise ValueError('Normalized steering must lie in [-1, 1].')
+            if base_output_rps == 0.0:
+                self._request_stop('Zero manual speed.')
+                return
+            self._validate_motion_settings()
 
-        radius = get_radius(angle)
-        if radius == 0 or (not math.isfinite(radius) and radius != math.inf):
-            self._request_stop('Invalid controller command: invalid or singular turning radius.')
-            return
+            # The legacy gamepad speed is base moteus output rps, not m/s.
+            # Under the documented wheel-referenced output assumption, this
+            # cancels the motor interface's m/s-to-rps conversion on a straight.
+            velocity_mps = base_output_rps * self._wheel_circumference_m
+            curvature = curvature_from_normalized_steering(
+                steering, reference_angle_rad=self.steering_reference_angle_rad,
+                geometry=MEASURED_GEOMETRY)
+            # A conservative common wheel-heading bound, NOT four assumed physical
+            # limits: the chosen reference must be safe for every corner and match Arduino.
+            limits = {
+                name: (-self.steering_reference_angle_rad, self.steering_reference_angle_rad)
+                for name, (x, _) in MEASURED_GEOMETRY.wheel_positions_m.items() if x != 0}
+            wheels = solve_curvature(
+                velocity_mps, curvature, geometry=MEASURED_GEOMETRY,
+                steering_limits_rad=limits)
+            velocities = {name: wheel.linear_velocity_mps for name, wheel in wheels.items()}
+            self._dispatch_command(velocities, steering)
+        except (TypeError, ValueError, OverflowError) as error:
+            self._request_stop(f'Invalid manual command: {error}')
+        except Exception as error:
+            self.get_logger().error(f'Hardware command failed: {error}')
+            self._request_stop('Hardware command failure.')
 
-        self._loop.run_until_complete(self._update_hardware(vel, angle, radius))
 
 def main(args=None):
-    """
-        Spins up server
-    """
     rclpy.init(args=args)
-
-    ralphee_hardware_controller = None
+    controller = None
     try:
-        ralphee_hardware_controller = RalpheeHardwareController()
-        rclpy.spin(ralphee_hardware_controller)
+        controller = RalpheeHardwareController()
+        rclpy.spin(controller)
     finally:
-        if ralphee_hardware_controller is not None:
-            ralphee_hardware_controller.destroy_node()
+        if controller is not None:
+            controller.destroy_node()
         rclpy.shutdown()
 
 
