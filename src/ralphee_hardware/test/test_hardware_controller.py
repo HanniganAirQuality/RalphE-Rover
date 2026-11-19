@@ -15,6 +15,7 @@ class FakeNode:
 
     def __init__(self, name):
         self.subscriptions = {}
+        self.publishers = {}
         self.logger = Mock()
         self.destroyed = False
 
@@ -25,6 +26,14 @@ class FakeNode:
         subscription = SimpleNamespace(message_type=message_type, callback=callback)
         self.subscriptions[topic] = subscription
         return subscription
+
+    def create_timer(self, period, callback, *, clock=None):
+        return SimpleNamespace(period=period, callback=callback, clock=clock)
+
+    def create_publisher(self, message_type, topic, depth):
+        publisher = Mock()
+        self.publishers[topic] = publisher
+        return publisher
 
     def get_logger(self):
         return self.logger
@@ -42,24 +51,34 @@ def fake_module(name, **attributes):
 
 class TestHardwareController(unittest.TestCase):
     def setUp(self):
-        self.motors, self.arduino = object(), object()
+        self.motors, self.arduino = object(), SimpleNamespace(close=Mock())
         self.motor_updates, self.servo_updates = [], []
         self.loops, self.initializations = [], []
-        self.fail_next_motor = False
+        self.fail_next_motor = self.fail_next_stop = False
+        self.motor_stops, self.watchdogs = [], []
+        self.now = 100.0
 
         async def init_motors():
             self.initializations.append('motors')
             self.loops.append(asyncio.get_running_loop())
             return self.motors
 
-        async def init_servos():
+        async def init_servos(*, write_timeout_s):
             self.initializations.append('servos')
             self.loops.append(asyncio.get_running_loop())
             return self.arduino
 
-        async def update_wheel_velocities(velocities, motors, *, max_output_rps):
+        async def stop_motors(motors, *, timeout_s):
+            self.motor_stops.append(motors)
+            if self.fail_next_stop:
+                self.fail_next_stop = False
+                raise RuntimeError('Fake failed stop')
+
+        async def update_wheel_velocities(
+                velocities, motors, *, max_output_rps, watchdog_timeout_s):
             self.loops.append(asyncio.get_running_loop())
             self.motor_updates.append((dict(velocities), motors, max_output_rps))
+            self.watchdogs.append(watchdog_timeout_s)
             if self.fail_next_motor:
                 self.fail_next_motor = False
                 raise RuntimeError('Fake motor command failure')
@@ -71,7 +90,8 @@ class TestHardwareController(unittest.TestCase):
         self.interfaces = {
             'ralphee_hardware.ralphee_motor_interface': fake_module(
                 'ralphee_hardware.ralphee_motor_interface',
-                init_motors=init_motors, update_wheel_velocities=update_wheel_velocities),
+                init_motors=init_motors, stop_motors=stop_motors,
+                update_wheel_velocities=update_wheel_velocities),
             'ralphee_hardware.ralphee_servo_interface': fake_module(
                 'ralphee_hardware.ralphee_servo_interface',
                 init_servos=init_servos, update_servos=update_servos),
@@ -81,6 +101,9 @@ class TestHardwareController(unittest.TestCase):
             'rclpy': fake_module('rclpy', __path__=[], init=forbidden_ros,
                                  spin=forbidden_ros, shutdown=forbidden_ros),
             'rclpy.node': fake_module('rclpy.node', Node=FakeNode),
+            'rclpy.clock': fake_module('rclpy.clock',
+                                      Clock=lambda **kwargs: SimpleNamespace(**kwargs),
+                                      ClockType=SimpleNamespace(STEADY_TIME='steady')),
             'geometry_msgs': fake_module('geometry_msgs', __path__=[]),
             'geometry_msgs.msg': fake_module('geometry_msgs.msg', Twist=SimpleNamespace),
             'std_msgs': fake_module('std_msgs', __path__=[]),
@@ -106,6 +129,9 @@ class TestHardwareController(unittest.TestCase):
             spec.loader.exec_module(module)
         self.geometry = sys.modules['ralphee_hardware.motion_geometry']
         self.module = sys.modules['controller_under_test']
+        clock_patch = patch.object(self.module, 'monotonic', lambda: self.now)
+        clock_patch.start()
+        self.addCleanup(clock_patch.stop)
         # Synthetic settings only, not measured physical steering or speed limits.
         self.reference = math.pi / 6
         self.limit = 2.0
@@ -121,11 +147,14 @@ class TestHardwareController(unittest.TestCase):
         self.addCleanup(node.destroy_node)
         return node
 
+    def arm(self, node, *, expected=True):
+        node.state_sub.callback(SimpleNamespace(data=0))
+        node.controller_sub.callback(SimpleNamespace(data=[0.0, 0.0]))
+        node.state_sub.callback(SimpleNamespace(data=3))
+        self.assertEqual(node.armed, expected)
+
     def assert_stop(self):
-        speeds, motors, _ = self.motor_updates[-1]
-        self.assertEqual(set(speeds), set(self.geometry.MEASURED_GEOMETRY.wheel_positions_m))
-        self.assertTrue(all(value == 0.0 for value in speeds.values()))
-        self.assertIs(motors, self.motors)
+        self.assertIs(self.motor_stops[-1], self.motors)
         self.assertEqual(self.servo_updates[-1], (0.0, self.arduino))
 
     def test_default_disabled_node_never_imports_or_initializes_devices(self):
@@ -147,6 +176,7 @@ class TestHardwareController(unittest.TestCase):
 
     def test_disabled_configured_node_calculates_and_logs_without_devices(self):
         node = self.make_node()
+        self.arm(node)
         with patch.object(node, '_dispatch_command', wraps=node._dispatch_command) as dispatch:
             node.controller_angle_vel_listener_callback(SimpleNamespace(data=[0.5, 0.25]))
         speeds, steering = dispatch.call_args.args
@@ -171,6 +201,7 @@ class TestHardwareController(unittest.TestCase):
 
     def test_forward_and_reverse_straight_preserve_legacy_output_rps(self):
         node = self.make_node(hardware=True)
+        self.arm(node)
         circumference = math.tau * self.geometry.MEASURED_GEOMETRY.nominal_wheel_radius_m
         for base_rps in (0.75, -0.75, 1.5, -1.5):
             with self.subTest(base_rps=base_rps):
@@ -184,6 +215,7 @@ class TestHardwareController(unittest.TestCase):
 
     def test_curved_manual_commands_use_real_geometry_and_unchanged_steering(self):
         node = self.make_node(hardware=True)
+        self.arm(node)
         radius = self.geometry.MEASURED_GEOMETRY.nominal_wheel_radius_m
         limits = {name: (-self.reference, self.reference)
                   for name in ('front_left', 'front_right', 'rear_left', 'rear_right')}
@@ -202,27 +234,38 @@ class TestHardwareController(unittest.TestCase):
                 self.assertEqual(self.servo_updates[-1], (steering, self.arduino))
                 self.assertTrue(all(loop is node._loop for loop in self.loops))
 
-    def test_zero_and_invalid_manual_commands_request_stop_and_recover(self):
+    def test_zero_and_invalid_commands_stop_and_invalid_requires_rearm(self):
         node = self.make_node(hardware=True)
-        commands = ([0.0, 0.8], [], [0.4], [0.4, 0.2, 0.1],
+        self.arm(node)
+        node.controller_sub.callback(SimpleNamespace(data=[0.4, 0.25]))
+        node.controller_sub.callback(SimpleNamespace(data=[0.0, 0.8]))
+        self.assert_stop()
+        self.assertTrue(node.armed)  # Zero speed stops; held A still permits later motion.
+        commands = ([], [0.4], [0.4, 0.2, 0.1],
                     [math.nan, 0.1], [0.4, math.inf], [-math.inf, 0.1],
                     [0.4, math.nan], [0.4, 1.01], [0.4, -1.01],
                     [None, 0.1], [True, 0.1])
         for data in commands:
             with self.subTest(data=data):
-                node.controller_angle_vel_listener_callback(SimpleNamespace(data=[0.4, 0.25]))
-                node.controller_angle_vel_listener_callback(SimpleNamespace(data=data))
+                self.arm(node)
+                node.controller_sub.callback(SimpleNamespace(data=data))
                 self.assert_stop()
-                node.controller_angle_vel_listener_callback(SimpleNamespace(data=[-0.3, 0.0]))
+                self.assertFalse(node.armed)
+                count = len(self.motor_updates)
+                node.controller_sub.callback(SimpleNamespace(data=[-0.3, 0.0]))
+                self.assertEqual(len(self.motor_updates), count)
+                self.arm(node)
+                node.controller_sub.callback(SimpleNamespace(data=[-0.3, 0.0]))
                 self.assertLess(self.motor_updates[-1][0]['front_left'], 0.0)
-                self.assertEqual(self.servo_updates[-1], (0.0, self.arduino))
 
     def test_excessive_outer_wheel_speed_stops_before_nonzero_outputs(self):
         node = self.make_node(hardware=True, limit=1.0)
+        self.arm(node)
         node.controller_angle_vel_listener_callback(SimpleNamespace(data=[0.9, 1.0]))
-        self.assertEqual(len(self.motor_updates), 1)
+        self.assertEqual(self.motor_updates, [])
         self.assert_stop()
-        self.assertEqual(self.servo_updates, [(0.0, self.arduino)])
+        self.assertFalse(node.armed)
+        self.assertTrue(all(angle == 0.0 for angle, _ in self.servo_updates))
 
     def test_invalid_settings_fail_before_hardware_imports(self):
         # Interfaces remain blocked: an early device import would fail this check.
@@ -238,6 +281,7 @@ class TestHardwareController(unittest.TestCase):
 
     def test_mode_changes_stop_and_nav2_never_drives(self):
         node = self.make_node(hardware=True)
+        self.arm(node)
         command = SimpleNamespace(linear=SimpleNamespace(x=0.6), angular=SimpleNamespace(z=0.2))
         node.controller_angle_vel_listener_callback(SimpleNamespace(data=[0.4, 0.25]))
         count = len(self.motor_updates)
@@ -256,52 +300,220 @@ class TestHardwareController(unittest.TestCase):
         self.assert_stop()
         node.state_sub.callback(SimpleNamespace(data=99))
         self.assert_stop()
-        node.controller_angle_vel_listener_callback(SimpleNamespace(data=[0.4, 0.0]))
+        count = len(self.motor_updates)
+        node.controller_sub.callback(SimpleNamespace(data=[0.4, 0.0]))
+        self.assertEqual(len(self.motor_updates), count)
+        self.arm(node)
+        node.controller_sub.callback(SimpleNamespace(data=[0.4, 0.0]))
         self.assertGreater(self.motor_updates[-1][0]['front_left'], 0.0)
 
-    def test_hardware_command_failure_requests_stop_and_recovery(self):
+    def test_hardware_command_failure_requests_stop_and_latches_fault(self):
         node = self.make_node(hardware=True)
+        self.arm(node)
         self.fail_next_motor = True
-        node.controller_angle_vel_listener_callback(SimpleNamespace(data=[0.4, 0.25]))
+        node.controller_sub.callback(SimpleNamespace(data=[0.4, 0.25]))
         node.logger.error.assert_called()
         self.assert_stop()
-        node.controller_angle_vel_listener_callback(SimpleNamespace(data=[0.4, 0.0]))
-        self.assertGreater(self.motor_updates[-1][0]['front_left'], 0.0)
-        self.fail_next_motor = True
+        self.assertFalse(node.armed)
+        self.assertTrue(node._actuator_fault)
+        count = len(self.motor_updates)
+        self.arm(node, expected=False)
+        node.controller_sub.callback(SimpleNamespace(data=[0.4, 0.0]))
+        self.assertEqual(len(self.motor_updates), count)
+        self.fail_next_stop = True
         node._request_stop('Fake failed stop')
         self.assertIn('Stop request failed', node.logger.error.call_args.args[0])
 
+    def test_startup_held_enable_or_non_neutral_cannot_arm(self):
+        node = self.make_node(hardware=True)
+        self.assertFalse(node.armed)
+        node.state_sub.callback(SimpleNamespace(data=3))
+        node.controller_sub.callback(SimpleNamespace(data=[0.0, 0.0]))
+        node.state_sub.callback(SimpleNamespace(data=3))
+        node.controller_sub.callback(SimpleNamespace(data=[0.4, 0.0]))
+        self.assertEqual(self.motor_updates, [])
+        node.state_sub.callback(SimpleNamespace(data=0))
+        node.controller_sub.callback(SimpleNamespace(data=[0.0, 0.5]))
+        node.state_sub.callback(SimpleNamespace(data=3))
+        self.assertFalse(node.armed)
+        self.arm(node)
+        node.controller_sub.callback(SimpleNamespace(data=[0.4, 0.0]))
+        self.assertEqual(len(self.motor_updates), 1)
+        node.state_sub.callback(SimpleNamespace(data=0))
+        self.assert_stop()
+        self.assertFalse(node.armed)
+
+    def test_command_watchdog_disarms_and_returning_messages_cannot_resume(self):
+        node = self.make_node(hardware=True)
+        self.arm(node)
+        node.controller_sub.callback(SimpleNamespace(data=[0.4, 0.0]))
+        self.now += 0.31
+        node.command_watchdog.callback()
+        self.assert_stop()
+        self.assertFalse(node.armed)
+        count = len(self.motor_updates)
+        for data in ([0.4, 0.0], [0.0, 0.0], [0.4, 0.0]):
+            node.controller_sub.callback(SimpleNamespace(data=data))
+            node.state_sub.callback(SimpleNamespace(data=3))
+        self.assertEqual(len(self.motor_updates), count)
+        self.arm(node)
+        node.controller_sub.callback(SimpleNamespace(data=[0.4, 0.0]))
+        self.assertEqual(len(self.motor_updates), count + 1)
+        self.assertEqual(node.command_watchdog.clock.clock_type, 'steady')
+        self.assertTrue(all(value == 0.5 for value in self.watchdogs))
+
+    def test_command_and_deadman_heartbeats_expire_independently(self):
+        for missing in ('command', 'deadman'):
+            with self.subTest(missing=missing):
+                node = self.make_node(hardware=True)
+                self.arm(node)
+                self.now += 0.15
+                if missing == 'command':
+                    node.state_sub.callback(SimpleNamespace(data=3))
+                else:
+                    node.controller_sub.callback(SimpleNamespace(data=[0.4, 0.0]))
+                self.now += 0.16
+                # Receipt handlers must detect timeout before processing a late command,
+                # even if the watchdog timer callback has not run.
+                if missing == 'command':
+                    node.state_sub.callback(SimpleNamespace(data=3))
+                else:
+                    node.controller_sub.callback(SimpleNamespace(data=[0.4, 0.0]))
+                self.assertFalse(node.armed)
+                self.assert_stop()
+
+    def test_stalled_actuator_update_times_out_and_latches_fault(self):
+        node = self.make_node(hardware=True)
+        self.arm(node)
+
+        async def stalled(*args, **kwargs):
+            await asyncio.Future()
+
+        with patch.object(node, '_update_wheel_velocities', stalled):
+            node.controller_sub.callback(SimpleNamespace(data=[0.4, 0.0]))
+        self.assertFalse(node.armed)
+        self.assertTrue(node._actuator_fault)
+        self.assert_stop()
+        self.assertEqual(asyncio.all_tasks(node._loop), set())
+
     def test_shutdown_requests_stop_and_closes_loop(self):
         node = self.make_node(hardware=True)
+        self.arm(node)
         node.controller_angle_vel_listener_callback(SimpleNamespace(data=[0.4, 0.25]))
         node.destroy_node()
         self.assert_stop()
         self.assertTrue(node._loop.is_closed())
         self.assertTrue(node.destroyed)
 
-    def test_failed_initialization_cancels_pending_task_and_closes_loop(self):
-        cancelled = []
-
-        async def waiting_motor_init():
-            try:
-                await asyncio.Future()
-            finally:
-                cancelled.append(True)
-
-        async def failing_servo_init():
+    def test_servo_initialization_failure_stops_already_initialized_motors(self):
+        async def failing_servo_init(**kwargs):
             raise RuntimeError('Fake initialization failure')
 
         loop = asyncio.new_event_loop()
         self.addCleanup(loop.close)
         with patch.object(self.module.asyncio, 'new_event_loop', return_value=loop):
-            with patch.multiple(self.interfaces['ralphee_hardware.ralphee_motor_interface'],
-                                init_motors=waiting_motor_init):
-                with patch.multiple(self.interfaces['ralphee_hardware.ralphee_servo_interface'],
-                                    init_servos=failing_servo_init):
-                    with self.assertRaisesRegex(RuntimeError, 'Fake initialization failure'):
-                        self.make_node(hardware=True)
-        self.assertEqual(cancelled, [True])
+            with patch.multiple(self.interfaces['ralphee_hardware.ralphee_servo_interface'],
+                                init_servos=failing_servo_init):
+                with self.assertRaisesRegex(RuntimeError, 'Fake initialization failure'):
+                    self.make_node(hardware=True)
+        self.assertIs(self.motor_stops[-1], self.motors)
+        self.assertEqual(self.motor_updates, [])
         self.assertTrue(loop.is_closed())
+
+    def test_reader_expires_completed_reads_and_discards_cached_controls(self):
+        source = self.source.parents[1] / 'ralphee_remote_control' / 'ralphee_remote_control'
+        fake_inputs = fake_module('inputs', get_gamepad=Mock())
+        spec = importlib.util.spec_from_file_location(
+            'reader_under_test', source / 'remote_controller.py')
+        reader_module = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {'inputs': fake_inputs}):
+            spec.loader.exec_module(reader_module)
+        with patch.object(reader_module.threading, 'Thread'):
+            reader = reader_module.Controller()
+        events = [SimpleNamespace(code=code, state=state) for code, state in
+                  (('ABS_Y', 16000), ('ABS_RX', 8000), ('BTN_SOUTH', 1))]
+
+        class EndRead(BaseException):
+            pass
+
+        def completed_read():
+            self.assertIsNone(reader.last_update_time)  # No timestamp before the read.
+            self.now += 1.0
+            return events
+
+        with patch.object(reader_module, 'monotonic', lambda: self.now):
+            call_count = 0
+
+            def read_once():
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    return completed_read()
+                raise EndRead()
+
+            fake_inputs.get_gamepad.side_effect = read_once
+            with self.assertRaises(EndRead):
+                reader.update()
+            self.assertEqual(reader.last_update_time, self.now)
+            self.assertTrue(reader.read_command(0.3)[-1])
+            self.assertGreater(reader.read_command(0.3)[0], 0.0)
+            self.now += 0.31  # Reader could now be blocked forever.
+            self.assertEqual(reader.read_command(0.3),
+                             (0.0, 0.0, False, False, False, False))
+            reader.update_inputs([SimpleNamespace(code='BTN_SOUTH', state=1)])
+            reader.last_update_time = self.now
+            self.assertFalse(reader.read_command(0.3)[-1])  # Cached axes cannot recover.
+            reader.update_inputs(events)
+            reader.last_update_time = self.now
+            reader._monitor_thread.is_alive.return_value = False
+            self.assertFalse(reader.read_command(0.3)[-1])
+            reader._monitor_thread.is_alive.return_value = True
+            with self.assertRaises(ValueError):
+                reader.update_inputs([SimpleNamespace(code='SYN_DROPPED', state=0)])
+            fake_inputs.get_gamepad.side_effect = [OSError('Disconnected'), EndRead()]
+            with patch.object(reader_module, 'sleep'):
+                with self.assertRaises(EndRead):
+                    reader.update()
+            self.assertIsNone(reader.last_update_time)
+            self.assertEqual((reader.velocity, reader.angle), (0.0, 0.0))
+
+    def test_publisher_deadman_loss_neutral_and_mode_gating(self):
+        source = self.source.parents[1] / 'ralphee_remote_control' / 'ralphee_remote_control'
+        reader = Mock()
+        package = fake_module('ralphee_remote_control', __path__=[])
+        reader_module = fake_module('ralphee_remote_control.remote_controller',
+                                   Controller=lambda: reader)
+        spec = importlib.util.spec_from_file_location(
+            'publisher_under_test', source / 'remote_control_publisher.py')
+        publisher_module = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {'ralphee_remote_control': package,
+                                     'ralphee_remote_control.remote_controller': reader_module}):
+            spec.loader.exec_module(publisher_module)
+        FakeNode.parameter_values = {}
+        publisher = publisher_module.ControllerPublisher()
+
+        def tick(speed=0.0, steering=0.0, enable=False, x=False, y=False, healthy=True):
+            reader.read_command.return_value = (speed, steering, enable, x, y, healthy)
+            publisher.timer_callback()
+            return (publisher.cmd_vel_pub.publish.call_args.args[0].data,
+                    publisher.state_pub.publish.call_args.args[0].data)
+
+        self.assertEqual(tick(0.5, enable=True), ([0.0, 0.0], 0))
+        tick()  # Released and neutral.
+        self.assertEqual(tick(enable=True), ([0.0, 0.0], 3))
+        self.assertEqual(tick(0.5, 0.2, enable=True), ([0.5, 0.2], 3))
+        self.assertEqual(tick(healthy=False), ([0.0, 0.0], 0))
+        self.assertEqual(tick(0.5, enable=True), ([0.0, 0.0], 0))
+        tick(0.5)  # Released but not neutral.
+        self.assertEqual(tick(enable=True), ([0.0, 0.0], 0))
+        tick()
+        self.assertEqual(tick(enable=True), ([0.0, 0.0], 3))
+        self.assertEqual(tick(0.5, enable=True, y=True), ([0.0, 0.0], 2))
+        self.assertEqual(tick(0.5, enable=True, x=True), ([0.0, 0.0], 0))
+        reader.read_command.side_effect = RuntimeError('Input reader unavailable')
+        publisher.timer_callback()
+        self.assertEqual(publisher.cmd_vel_pub.publish.call_args.args[0].data, [0.0, 0.0])
+        self.assertEqual(publisher.state_pub.publish.call_args.args[0].data, 0)
 
 
 if __name__ == '__main__':

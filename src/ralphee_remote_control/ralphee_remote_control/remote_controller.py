@@ -1,9 +1,7 @@
 import inputs
 import threading
 import math
-from enum import IntEnum
-import os
-from time import sleep, time
+from time import sleep, monotonic
 import importlib
 
 DEADZONE = 0.025
@@ -19,7 +17,7 @@ class Controller(object):
 
     def __init__(self):
         self.velocity: float = 0.0
-        self.angle: float = math.nan
+        self.angle: float = 0.0
 
         self.LeftJoystickY = 0
         self.LeftJoystickX = 0
@@ -42,7 +40,9 @@ class Controller(object):
         self.UpDPad = 0
         self.DownDPad = 0
 
-        self.last_update_time = time()
+        self._lock = threading.Lock()
+        self.last_update_time = None
+        self._seen_controls = set()
 
         self._monitor_thread = threading.Thread(target=self.update, args=())
         self._monitor_thread.daemon = True
@@ -50,28 +50,68 @@ class Controller(object):
 
     def update(self):
         while True:
-            self.last_update_time = time()
-            events = None
             try:
+                # This blocks. Only a completed, processed read can refresh health.
                 events = inputs.get_gamepad()
-            except:
-                print('[update_inputs] not connected!')
-                importlib.reload(inputs)
-                self.velocity = 0
-                self.angle = 0
+                with self._lock:
+                    if events:
+                        self.update_inputs(events)
+                        self.update_velocity()
+                        self.update_angle()
+                        self.last_update_time = monotonic()
+                    else:
+                        self._invalidate_input()
+                if not events:
+                    sleep(0.01)
+            except Exception as error:
+                with self._lock:
+                    self._invalidate_input()
+                print(f'[update_inputs] input unavailable: {error}')
+                try:
+                    importlib.reload(inputs)
+                except Exception:
+                    pass  # Remain unhealthy; retry discovery on the next failure.
                 sleep(1)
-                continue
-            
-            self.update_inputs(events)
-            if self.B and self.A and self.X and self.Y:
-                print('shutdown!')
-                os.system("sudo shutdown") 
-            self.update_velocity()  
-            self.update_angle()
-            sleep(0.1)
+
+    def _invalidate_input(self):
+        # Called under the lock. Never reuse cached axes/buttons after a gap.
+        self.velocity = self.angle = 0.0
+        self.LeftJoystickY = self.RightJoystickX = 0
+        self.LeftTrigger = self.RightTrigger = 0
+        self.LeftBumper = self.RightBumper = 0
+        self.A = self.X = self.Y = 0
+        self.last_update_time = None
+        self._seen_controls.clear()
+
+    def read_command(self, timeout_s):
+        """Return an atomic (speed, steering, A, X, Y, healthy) snapshot.
+
+        No events means unknown health, not permission to repeat old movement.
+        After startup/loss, require fresh reports of both drive axes and A.
+        """
+        with self._lock:
+            if (self.last_update_time is None
+                    or not self._monitor_thread.is_alive()
+                    or monotonic() - self.last_update_time >= timeout_s):
+                self._invalidate_input()
+            healthy = {'ABS_Y', 'ABS_RX', 'BTN_SOUTH'} <= self._seen_controls
+            if not healthy:
+                return 0.0, 0.0, False, False, False, False
+            return self.velocity, self.angle, bool(self.A), bool(self.X), bool(self.Y), True
 
     def update_inputs(self, events):
         for event in events:
+            if event.code == 'SYN_DROPPED':
+                raise ValueError('Gamepad events were lost; current input is unknown.')
+            if not math.isfinite(event.state):
+                raise ValueError('Nonfinite gamepad report.')
+            if event.code in ('ABS_Y', 'ABS_RX'):
+                if abs(event.state) > self.MAX_JOY_VAL:
+                    raise ValueError('Invalid drive-axis report.')
+            if event.code in ('BTN_SOUTH', 'BTN_WEST', 'BTN_NORTH'):
+                if event.state not in (0, 1):
+                    raise ValueError('Invalid enable/mode button report.')
+            self._seen_controls.add(event.code)
             if event.code == 'ABS_Y':
                 self.LeftJoystickY = event.state / Controller.MAX_JOY_VAL # normalize between -1 and 1
             elif event.code == 'ABS_X':

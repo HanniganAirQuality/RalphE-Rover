@@ -1,3 +1,4 @@
+import asyncio
 import moteus
 import time
 import math
@@ -12,6 +13,31 @@ from ralphee_hardware.motion_geometry import MEASURED_GEOMETRY
 # 0 3
 LEFT_MOTOR_IDS  = [2, 5, 3]
 RIGHT_MOTOR_IDS = [0, 4, 1]
+
+# Publisher runs at 10 Hz. This is a backup for a stopped ROS/Python process,
+# not an input-health check. Verify latency and the deployed watchdog action.
+DEFAULT_WATCHDOG_TIMEOUT_S = 0.5
+
+
+async def stop_motors(controller_groups, *, timeout_s=0.2):
+    """Attempt every motor even if another stop fails or never replies."""
+    failures = []
+    # Keep the existing sequential bus communication; give each motor its own
+    # timeout, so a failed first controller cannot consume every stop attempt.
+    for group in controller_groups:
+        for controller in group:
+            try:
+                result = await asyncio.wait_for(
+                    controller.set_stop(query=True), timeout=timeout_s)
+                if (result is None or result.values.get(moteus.Register.FAULT) != 0
+                        or result.values.get(moteus.Register.MODE) != moteus.Mode.STOPPED):
+                    raise RuntimeError('Missing healthy stopped-mode acknowledgement.')
+            except Exception as error:
+                failures.append(
+                    f'Motor {getattr(controller, "id", "unknown")}: '
+                    f'{str(error) or type(error).__name__}')
+    if failures:
+        raise RuntimeError('Motor stop failed: ' + '; '.join(failures))
 
 # [0] = Left Non Center
 # [1] = Left Center
@@ -72,16 +98,14 @@ async def init_motors() -> list[list[moteus.Controller]]:
 
     # Reset motors incase of inpropper shutdown.
     print('[init_motors] set stop')
-    for c in left_controllers:
-        await c.set_stop()
-    for c in right_controllers:
-        await c.set_stop()
+    await stop_motors([left_controllers, right_controllers])
     print('[init_motors] ready!')
 
     # Return groups
     return [left_controllers, right_controllers]
 
-async def update_motors(velocity: float, radius: float, controller_groups: list[list[moteus.Controller]]):
+async def update_motors(velocity: float, radius: float, controller_groups: list[list[moteus.Controller]],
+                        *, watchdog_timeout_s=DEFAULT_WATCHDOG_TIMEOUT_S):
     """
         Updates motor velocities. https://www.desmos.com/calculator/pwxu4jlu2f
         Args:
@@ -92,6 +116,8 @@ async def update_motors(velocity: float, radius: float, controller_groups: list[
             controller_groups:
                 Controller groups to be set.
     """
+    if not math.isfinite(watchdog_timeout_s) or watchdog_timeout_s <= 0:
+        raise ValueError('watchdog_timeout_s must be finite and positive.')
     coroutines = []
 
     if math.isfinite(radius):
@@ -113,11 +139,13 @@ async def update_motors(velocity: float, radius: float, controller_groups: list[
     # Start coroutines
     for i, c in enumerate(controller_groups[LEFT_SIDE_INDEX]):
         v = left_velocity if i != 1 else left_center_velocity
-        coroutines.append(c.set_position(position=math.nan, velocity=v, query=True, watchdog_timeout=10.0))
+        coroutines.append(c.set_position(position=math.nan, velocity=v, query=True,
+                                        watchdog_timeout=watchdog_timeout_s))
 
     for i, c in enumerate(controller_groups[RIGHT_SIDE_INDEX]):
         v = right_velocity if i != 1 else right_center_velocity
-        coroutines.append(c.set_position(position=math.nan, velocity=v, query=True, watchdog_timeout=10.0))
+        coroutines.append(c.set_position(position=math.nan, velocity=v, query=True,
+                                        watchdog_timeout=watchdog_timeout_s))
 
     # print(f'[update_motors] lv: {left_velocity}, lcv: {left_center_velocity}, rv: {right_velocity}, rcv: {right_center_velocity}')
 
@@ -152,6 +180,7 @@ async def update_wheel_velocities(
     controller_groups: list[list[moteus.Controller]],
     *,
     max_output_rps: float,
+    watchdog_timeout_s: float = DEFAULT_WATCHDOG_TIMEOUT_S,
 ):
     """Send six independent wheel velocities after validating the whole request.
 
@@ -162,7 +191,8 @@ async def update_wheel_velocities(
 
     max_output_rps is a required positive magnitude limit for every wheel in
     either direction. Invalid requests raise ValueError before any command;
-    speeds are never clipped. The legacy update_motors() interface is unchanged.
+    speeds are never clipped. watchdog_timeout_s is the moteus backup timeout,
+    in seconds; the ROS controller must also enforce fresh input and arming.
     """
     wheel_names = (
         ('front_left', 'middle_left', 'rear_left'),
@@ -179,6 +209,9 @@ async def update_wheel_velocities(
         raise ValueError('max_output_rps must be a finite positive number.') from None
     if not math.isfinite(limit) or limit <= 0:
         raise ValueError('max_output_rps must be a finite positive number.')
+    if (isinstance(watchdog_timeout_s, (str, bytes, bool))
+            or not math.isfinite(watchdog_timeout_s) or watchdog_timeout_s <= 0):
+        raise ValueError('watchdog_timeout_s must be finite and positive.')
     try:
         valid_groups = len(controller_groups) == 2 and all(
             len(group) == 3 for group in controller_groups)
@@ -200,5 +233,10 @@ async def update_wheel_velocities(
             commands.append((controller, direction * output_rps))
 
     for controller, output_rps in commands:
-        await controller.set_position(
-            position=math.nan, velocity=output_rps, query=True, watchdog_timeout=10.0)
+        result = await controller.set_position(
+            position=math.nan, velocity=output_rps, query=True,
+            watchdog_timeout=watchdog_timeout_s)
+        if (result is None or result.values.get(moteus.Register.FAULT) != 0
+                or result.values.get(moteus.Register.MODE) != moteus.Mode.POSITION):
+            raise RuntimeError(
+                f'Motor {controller.id}: missing healthy position-mode acknowledgement: {result}')
