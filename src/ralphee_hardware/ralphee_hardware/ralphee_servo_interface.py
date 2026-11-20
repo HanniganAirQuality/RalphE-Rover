@@ -5,12 +5,12 @@ import os.path
 async def init_servos(*, write_timeout_s=0.2) -> serial.Serial:
     print('[init_servos] create arduino object')
     # Check for existence of file
-    if not os.path.exists('/dev/arduino'):
+    if not os.path.exists('/dev/ttyACM0'):
         raise Exception('[init_servos] arduino not plugged in!')
     
     # Creates arduino object
     # A stuck write must not hold up the controller's stop/watchdog handling.
-    arduino = serial.Serial('/dev/arduino', 9600, write_timeout=write_timeout_s)
+    arduino = serial.Serial('/dev/ttyACM0', 9600, write_timeout=write_timeout_s)
 
     # Sets up usb port
     print('[init_servos] setup serial port for arduino')
