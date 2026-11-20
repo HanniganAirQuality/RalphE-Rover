@@ -45,6 +45,7 @@ class RalpheeHardwareController(Node):
         self._enable_held = self._release_seen = self._neutral_seen = False
         self._last_command_time = self._last_enable_time = None
         self._actuator_fault = False  # Latched until node restart.
+        self._motors_stopped = False  # True only after all six stop acknowledgements.
         self.cmd_vel_sub = self.create_subscription(
             Twist, 'cmd_vel', self.nav2_listener_callback, 1)
         self.controller_sub = self.create_subscription(
@@ -104,6 +105,7 @@ class RalpheeHardwareController(Node):
     async def _initialize_hardware(self):
         # Retain each handle immediately so a later startup failure can stop/close it.
         self.motors = await self._init_motors()
+        self._motors_stopped = True  # init_motors confirms all six stopped.
         self.arduino = await self._init_servos(write_timeout_s=self.hardware_io_timeout_s)
         await self._update_servos(0.0, self.arduino)
 
@@ -128,24 +130,32 @@ class RalpheeHardwareController(Node):
             f'Calculated wheel velocities (m/s): {wheel_velocities_mps}; '
             f'Arduino normalized steering: {steering}')
         if self.hardware_output_enabled:
+            # Even a partial/failed drive attempt invalidates the stop confirmation.
+            self._motors_stopped = False
             self._loop.run_until_complete(asyncio.wait_for(
                 self._update_hardware(wheel_velocities_mps, steering),
                 timeout=self.hardware_io_timeout_s))
 
     async def _stop_hardware(self):
-        requests = []
-        if self.motors is not None:
-            requests.append(self._stop_motors(
-                self.motors, timeout_s=self.hardware_io_timeout_s))
+        errors = []
+        if self.motors is not None and not self._motors_stopped:
+            try:
+                # Prioritize all motor stops over the synchronous serial write.
+                # timeout_s is one deadline for the entire six-motor batch.
+                await self._stop_motors(self.motors, timeout_s=self.hardware_io_timeout_s)
+                self._motors_stopped = True
+            except Exception as error:
+                errors.append(f'Motor stop: {error}')
         if self.arduino is not None:
-            requests.append(self._update_servos(0.0, self.arduino))
-        results = await asyncio.gather(*requests, return_exceptions=True)
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
+            try:
+                await self._update_servos(0.0, self.arduino)
+            except Exception as error:
+                errors.append(f'Steering center: {error}')
+        if errors:
+            raise RuntimeError('; '.join(errors))
 
     def _stop_outputs(self):
-        """Stopping bypasses velocity validation and attempts all six motors."""
+        """Stop all six unless already acknowledged stopped; always center steering."""
         if self.hardware_output_enabled:
             try:
                 self._loop.run_until_complete(self._stop_hardware())
@@ -180,6 +190,8 @@ class RalpheeHardwareController(Node):
                 task.cancel()
             if pending:
                 self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            # Shutdown gets one fresh stop attempt even if idle messages were skipped.
+            self._motors_stopped = False
             self._request_stop('Controller shutting down.')
             if self.hardware_output_enabled:
                 if self.arduino is not None:

@@ -24,12 +24,12 @@ class ControllerPublisher(Node):
         self._previous_enable = True  # Must observe a release, including at startup.
         timer_period = 0.1  # seconds
         self.timer = self.create_timer(timer_period, self.timer_callback)
-        self.controller = Controller()
+        self.controller = Controller(input_timeout_s=self.input_timeout_s)
 
     def timer_callback(self):
         vel = angle = 0.0
         try:
-            vel, angle, enable, x, y, healthy = self.controller.read_command(self.input_timeout_s)
+            vel, angle, enable, x, y, healthy = self.controller.read_command()
             healthy = (healthy and math.isfinite(vel) and math.isfinite(angle)
                        and -1.0 <= angle <= 1.0)
         except Exception as error:

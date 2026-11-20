@@ -20,22 +20,28 @@ DEFAULT_WATCHDOG_TIMEOUT_S = 0.5
 
 
 async def stop_motors(controller_groups, *, timeout_s=0.2):
-    """Attempt every motor even if another stop fails or never replies."""
+    """Send all six stops in one bus cycle, with one deadline for all replies."""
+    if not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise ValueError('Stop timeout must be finite and positive seconds.')
+    controllers = [controller for group in controller_groups for controller in group]
+    if len(controllers) != 6 or len({controller.id for controller in controllers}) != 6:
+        raise ValueError('Stopping requires six distinct motor controllers.')
+    # All controllers use the existing default fdcanusb transport. A batch sends
+    # every stop before waiting for replies, rather than waiting on each motor.
+    commands = [controller.make_stop(query=True) for controller in controllers]
+    try:
+        results = await asyncio.wait_for(
+            moteus.get_singleton_transport().cycle(commands), timeout=timeout_s)
+    except TimeoutError as error:
+        raise RuntimeError(
+            f'All-six motor stop batch timed out after {timeout_s} s; stop not confirmed.') from error
+    by_id = {result.id: result for result in results}
     failures = []
-    # Keep the existing sequential bus communication; give each motor its own
-    # timeout, so a failed first controller cannot consume every stop attempt.
-    for group in controller_groups:
-        for controller in group:
-            try:
-                result = await asyncio.wait_for(
-                    controller.set_stop(query=True), timeout=timeout_s)
-                if (result is None or result.values.get(moteus.Register.FAULT) != 0
-                        or result.values.get(moteus.Register.MODE) != moteus.Mode.STOPPED):
-                    raise RuntimeError('Missing healthy stopped-mode acknowledgement.')
-            except Exception as error:
-                failures.append(
-                    f'Motor {getattr(controller, "id", "unknown")}: '
-                    f'{str(error) or type(error).__name__}')
+    for controller in controllers:
+        result = by_id.get(controller.id)
+        if (result is None or result.values.get(moteus.Register.FAULT) != 0
+                or result.values.get(moteus.Register.MODE) != moteus.Mode.STOPPED):
+            failures.append(f'Motor {controller.id}: missing healthy stopped-mode acknowledgement.')
     if failures:
         raise RuntimeError('Motor stop failed: ' + '; '.join(failures))
 

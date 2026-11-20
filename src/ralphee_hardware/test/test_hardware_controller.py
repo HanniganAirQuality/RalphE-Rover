@@ -7,7 +7,7 @@ from pathlib import Path
 import sys
 from types import ModuleType, SimpleNamespace
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, patch, mock_open
 
 
 class FakeNode:
@@ -60,6 +60,7 @@ class TestHardwareController(unittest.TestCase):
 
         async def init_motors():
             self.initializations.append('motors')
+            self.motor_stops.append(self.motors)  # init_motors acknowledges all six stops.
             self.loops.append(asyncio.get_running_loop())
             return self.motors
 
@@ -320,9 +321,7 @@ class TestHardwareController(unittest.TestCase):
         self.arm(node, expected=False)
         node.controller_sub.callback(SimpleNamespace(data=[0.4, 0.0]))
         self.assertEqual(len(self.motor_updates), count)
-        self.fail_next_stop = True
-        node._request_stop('Fake failed stop')
-        self.assertIn('Stop request failed', node.logger.error.call_args.args[0])
+
 
     def test_startup_held_enable_or_non_neutral_cannot_arm(self):
         node = self.make_node(hardware=True)
@@ -420,9 +419,12 @@ class TestHardwareController(unittest.TestCase):
         self.assertEqual(self.motor_updates, [])
         self.assertTrue(loop.is_closed())
 
-    def test_reader_expires_completed_reads_and_discards_cached_controls(self):
+    def test_reader_polls_stationary_state_and_expires_stalls_or_disconnects(self):
         source = self.source.parents[1] / 'ralphee_remote_control' / 'ralphee_remote_control'
-        fake_inputs = fake_module('inputs', get_gamepad=Mock())
+        fake_inputs = fake_module(
+            'inputs', get_gamepad=Mock(side_effect=AssertionError('Blocking reader forbidden')),
+            DeviceManager=lambda: SimpleNamespace(gamepads=[
+                SimpleNamespace(get_char_device_path=lambda: '/mock/gamepad')]))
         spec = importlib.util.spec_from_file_location(
             'reader_under_test', source / 'remote_controller.py')
         reader_module = importlib.util.module_from_spec(spec)
@@ -430,59 +432,214 @@ class TestHardwareController(unittest.TestCase):
             spec.loader.exec_module(reader_module)
         with patch.object(reader_module.threading, 'Thread'):
             reader = reader_module.Controller()
-        events = [SimpleNamespace(code=code, state=state) for code, state in
-                  (('ABS_Y', 16000), ('ABS_RX', 8000), ('BTN_SOUTH', 1))]
+        reader._monitor_thread.is_alive.return_value = True
 
         class EndRead(BaseException):
             pass
 
-        def completed_read():
-            self.assertIsNone(reader.last_update_time)  # No timestamp before the read.
-            self.now += 1.0
-            return events
+        # Fixed state with no change events. These are synthetic Xbox-format values.
+        def state_ioctl(device, request, buffer):
+            if request == 0x80604518:
+                keys = bytearray(96)
+                keys[0x130 // 8] |= 1 << (0x130 % 8)  # Hold A.
+                return bytes(keys)
+            self.assertEqual(len(buffer), 24)
+            value = {0x80184541: 16000, 0x80184543: 8000,
+                     0x80184542: 0, 0x80184545: 0}[request]
+            minimum, maximum = (-32768, 32767) if request in (
+                0x80184541, 0x80184543) else (0, 255)
+            return reader_module.struct.pack('=6i', value, minimum, maximum, 0, 0, 0)
 
-        with patch.object(reader_module, 'monotonic', lambda: self.now):
-            call_count = 0
+        snapshots = []
 
-            def read_once():
-                nonlocal call_count
-                call_count += 1
-                if call_count == 1:
-                    return completed_read()
+        def ten_polls(seconds):
+            self.assertEqual(seconds, 0.05)
+            snapshots.append(reader.read_command())
+            self.now += seconds
+            if len(snapshots) == 10:
                 raise EndRead()
 
-            fake_inputs.get_gamepad.side_effect = read_once
+        with patch.object(reader_module, 'monotonic', lambda: self.now), \
+                patch.object(reader_module, 'ioctl', side_effect=state_ioctl), \
+                patch('builtins.open', mock_open()), \
+                patch.object(reader_module, 'sleep', side_effect=ten_polls):
             with self.assertRaises(EndRead):
                 reader.update()
-            self.assertEqual(reader.last_update_time, self.now)
-            self.assertTrue(reader.read_command(0.3)[-1])
-            self.assertGreater(reader.read_command(0.3)[0], 0.0)
-            self.now += 0.31  # Reader could now be blocked forever.
-            self.assertEqual(reader.read_command(0.3),
+            # More than the 0.3 s freshness window, with identical held controls.
+            self.assertFalse(snapshots[0][-1])  # Startup loss must be delivered once.
+            self.assertTrue(all(sample[-1] for sample in snapshots[1:]))
+            self.assertTrue(all(sample[0] > 0.0 and sample[2] for sample in snapshots[1:]))
+            self.assertEqual(snapshots[1:], [snapshots[1]] * 9)
+            fake_inputs.get_gamepad.assert_not_called()
+
+            # A stalled reader cannot keep its previous nonzero snapshot healthy.
+            self.now += 0.31
+            self.assertEqual(reader.read_command(),
                              (0.0, 0.0, False, False, False, False))
-            reader.update_inputs([SimpleNamespace(code='BTN_SOUTH', state=1)])
-            reader.last_update_time = self.now
-            self.assertFalse(reader.read_command(0.3)[-1])  # Cached axes cannot recover.
-            reader.update_inputs(events)
-            reader.last_update_time = self.now
+
+        def end_after_poll(seconds):
+            raise EndRead()
+
+        with patch.object(reader_module, 'monotonic', lambda: self.now), \
+                patch.object(reader_module, 'ioctl', side_effect=state_ioctl), \
+                patch('builtins.open', mock_open()), \
+                patch.object(reader_module, 'sleep', side_effect=end_after_poll):
+            with self.assertRaises(EndRead):
+                reader.update()
+            self.assertTrue(reader.read_command()[-1])
+            # Recovery between ROS ticks must still announce an input loss.
+            self.now += 0.31
+            with self.assertRaises(EndRead):
+                reader.update()
+            self.assertFalse(reader.read_command()[-1])
+            self.assertTrue(reader.read_command()[-1])
             reader._monitor_thread.is_alive.return_value = False
-            self.assertFalse(reader.read_command(0.3)[-1])
+            self.assertFalse(reader.read_command()[-1])
             reader._monitor_thread.is_alive.return_value = True
-            with self.assertRaises(ValueError):
-                reader.update_inputs([SimpleNamespace(code='SYN_DROPPED', state=0)])
-            fake_inputs.get_gamepad.side_effect = [OSError('Disconnected'), EndRead()]
-            with patch.object(reader_module, 'sleep'):
+
+        def slow_ioctl(device, request, buffer):
+            result = state_ioctl(device, request, buffer)
+            if request == 0x80604518:
+                self.now += 0.31
+            return result
+
+        for backend in (slow_ioctl, Mock(side_effect=OSError('Controller disconnected'))):
+            with patch.object(reader_module, 'monotonic', lambda: self.now), \
+                    patch.object(reader_module, 'ioctl', side_effect=backend), \
+                    patch('builtins.open', mock_open()), \
+                    patch.object(reader_module, 'sleep', side_effect=end_after_poll):
                 with self.assertRaises(EndRead):
                     reader.update()
-            self.assertIsNone(reader.last_update_time)
-            self.assertEqual((reader.velocity, reader.angle), (0.0, 0.0))
+                self.assertIsNone(reader.last_update_time)
+                self.assertEqual(reader.read_command(),
+                                 (0.0, 0.0, False, False, False, False))
+
+    def test_confirmed_stop_is_reused_but_drive_and_failed_stop_invalidate_it(self):
+        node = self.make_node(hardware=True)
+        initial_stops = len(self.motor_stops)
+        for _ in range(5):
+            node.controller_sub.callback(SimpleNamespace(data=[0.0, 0.5]))
+        self.assertEqual(len(self.motor_stops), initial_stops)
+        self.assertTrue(node._motors_stopped)
+
+        self.arm(node)
+        node.controller_sub.callback(SimpleNamespace(data=[0.4, 0.0]))
+        self.assertFalse(node._motors_stopped)
+        node.controller_sub.callback(SimpleNamespace(data=[0.0, 0.0]))
+        self.assertEqual(len(self.motor_stops), initial_stops + 1)
+        self.assertTrue(node._motors_stopped)
+        for _ in range(5):
+            node.controller_sub.callback(SimpleNamespace(data=[0.0, 0.0]))
+        self.assertEqual(len(self.motor_stops), initial_stops + 1)
+
+        node.controller_sub.callback(SimpleNamespace(data=[0.4, 0.0]))
+        self.fail_next_stop = True
+        node.controller_sub.callback(SimpleNamespace(data=[0.0, 0.0]))
+        self.assertFalse(node._motors_stopped)
+        self.assertFalse(node.armed)
+        self.assertTrue(node._actuator_fault)
+        self.assertIn('Stop request failed', node.logger.error.call_args.args[0])
+        failed_count = len(self.motor_stops)
+        node.controller_sub.callback(SimpleNamespace(data=[0.0, 0.0]))
+        self.assertEqual(len(self.motor_stops), failed_count + 1)  # Retry unconfirmed stop.
+        self.assertTrue(node._motors_stopped)
+        self.arm(node, expected=False)  # Successful stop does not clear the fault latch.
+        count = len(self.motor_stops)
+        node.destroy_node()
+        self.assertEqual(len(self.motor_stops), count + 1)  # Fresh final stop.
+
+    def test_motor_stop_precedes_serial_write_and_still_centers_after_failure(self):
+        node = self.make_node(hardware=True)
+        order = []
+
+        async def stop_motors(*args, **kwargs):
+            order.append('motor batch sent')
+            await asyncio.sleep(0)
+            order.append('motor batch acknowledged')
+
+        async def center(*args):
+            order.append('steering center')
+
+        async def failed_stop(*args, **kwargs):
+            order.append('motor batch failed')
+            raise OSError('Fake bus error')
+
+        node._motors_stopped = False
+        with patch.object(node, '_stop_motors', stop_motors), \
+                patch.object(node, '_update_servos', center):
+            node._stop_outputs()
+        self.assertEqual(order, ['motor batch sent', 'motor batch acknowledged', 'steering center'])
+        self.assertTrue(node._motors_stopped)
+        order.clear()
+        node._motors_stopped = False
+        with patch.object(node, '_stop_motors', failed_stop), \
+                patch.object(node, '_update_servos', center):
+            node._stop_outputs()
+        self.assertEqual(order, ['motor batch failed', 'steering center'])
+        self.assertFalse(node._motors_stopped)
+        self.assertTrue(node._actuator_fault)
+
+    def test_motor_stop_batches_all_six_before_waiting_with_one_deadline(self):
+        sdk = fake_module(
+            'moteus', Controller=object,
+            Register=SimpleNamespace(MODE='mode', FAULT='fault'),
+            Mode=SimpleNamespace(STOPPED=0))
+        fake_numpy = fake_module('numpy', ndarray=list, array=lambda values: values)
+        spec = importlib.util.spec_from_file_location(
+            'motor_interface_under_test', self.source / 'ralphee_motor_interface.py')
+        interface = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {'moteus': sdk, 'usb': fake_module('usb'),
+                                     'numpy': fake_numpy}):
+            spec.loader.exec_module(interface)
+        ids = [2, 5, 3, 0, 4, 1]
+        controllers = [SimpleNamespace(
+            id=motor_id, make_stop=Mock(return_value=SimpleNamespace(destination=motor_id)))
+            for motor_id in ids]
+        groups = [controllers[:3], controllers[3:]]
+        sent = []
+        replies = [SimpleNamespace(id=motor_id, values={'mode': 0, 'fault': 0})
+                   for motor_id in ids]
+        stalled = False
+
+        async def cycle(commands):
+            sent.extend(command.destination for command in commands)
+            if stalled:
+                await asyncio.Future()
+            return replies
+
+        sdk.get_singleton_transport = lambda: SimpleNamespace(cycle=cycle)
+
+        async def check():
+            nonlocal stalled
+            await interface.stop_motors(groups, timeout_s=0.01)
+            self.assertEqual(sent, ids)
+            for controller in controllers:
+                controller.make_stop.assert_called_once_with(query=True)
+            sent.clear()
+            replies.pop(0)  # First motor does not reply; all other stops still get sent.
+            with self.assertRaisesRegex(RuntimeError, 'Motor 2'):
+                await interface.stop_motors(groups, timeout_s=0.01)
+            self.assertEqual(sent, ids)
+            sent.clear()
+            stalled = True
+            # Use the real async wait and verify one deadline for the entire batch.
+            with patch.object(interface.asyncio, 'wait_for',
+                              wraps=asyncio.wait_for) as wait:
+                with self.assertRaisesRegex(RuntimeError, 'batch timed out'):
+                    await interface.stop_motors(groups, timeout_s=0.01)
+                self.assertEqual(wait.call_count, 1)
+                self.assertEqual(wait.call_args.kwargs['timeout'], 0.01)
+            self.assertEqual(sent, ids)
+            self.assertEqual(asyncio.all_tasks(), {asyncio.current_task()})
+
+        asyncio.run(check())
 
     def test_publisher_deadman_loss_neutral_and_mode_gating(self):
         source = self.source.parents[1] / 'ralphee_remote_control' / 'ralphee_remote_control'
         reader = Mock()
         package = fake_module('ralphee_remote_control', __path__=[])
         reader_module = fake_module('ralphee_remote_control.remote_controller',
-                                   Controller=lambda: reader)
+                                   Controller=lambda **kwargs: reader)
         spec = importlib.util.spec_from_file_location(
             'publisher_under_test', source / 'remote_control_publisher.py')
         publisher_module = importlib.util.module_from_spec(spec)
