@@ -19,31 +19,55 @@ RIGHT_MOTOR_IDS = [0, 4, 1]
 DEFAULT_WATCHDOG_TIMEOUT_S = 0.5
 
 
+def _motor_reply_mode(controller, result):
+    """Require a reply from this motor, with mode/fault fields and no fault."""
+    if result is None or result.id != controller.id:
+        raise RuntimeError(f'Motor {controller.id}: missing or mismatched reply.')
+    mode = result.values.get(moteus.Register.MODE)
+    fault = result.values.get(moteus.Register.FAULT)
+    if (fault != 0 or not isinstance(mode, int) or isinstance(mode, bool)
+            or not 0 <= mode <= 15 or mode in (moteus.Mode.FAULT, moteus.Mode.TIMEOUT)):
+        raise RuntimeError(f'Motor {controller.id}: MODE={mode}, FAULT={fault}.')
+    return mode
+
+
+async def _verify_motor_modes(controllers, expected_mode):
+    """Query until every motor reaches the requested mode; caller bounds time."""
+    pending = list(controllers)
+    transport = moteus.get_singleton_transport()
+    while pending:
+        # Firmware stages register writes before applying them in Poll()/the ISR.
+        # Yield before each independent read; the read, not this delay, proves mode.
+        await asyncio.sleep(0.001)
+        results = await transport.cycle([controller.make_query() for controller in pending])
+        by_id = {result.id: result for result in results}
+        pending = [
+            controller for controller in pending
+            if _motor_reply_mode(controller, by_id.get(controller.id)) != expected_mode]
+        # Internal enabling/calibration modes (2/3/4) or the previous healthy mode
+        # may persist briefly. They are never accepted as the requested final mode.
+
+
 async def stop_motors(controller_groups, *, timeout_s=0.2):
-    """Send all six stops in one bus cycle, with one deadline for all replies."""
+    """Batch all six stops, then independently confirm stopped mode/fault=0."""
     if not math.isfinite(timeout_s) or timeout_s <= 0:
         raise ValueError('Stop timeout must be finite and positive seconds.')
     controllers = [controller for group in controller_groups for controller in group]
     if len(controllers) != 6 or len({controller.id for controller in controllers}) != 6:
         raise ValueError('Stopping requires six distinct motor controllers.')
-    # All controllers use the existing default fdcanusb transport. A batch sends
-    # every stop before waiting for replies, rather than waiting on each motor.
-    commands = [controller.make_stop(query=True) for controller in controllers]
+    # Keep the existing default fdcanusb transport and all-six stop batch.
+    # A combined write/query can report the PREVIOUS mode, so request no state
+    # in the stop frame and verify all six with subsequent query-only frames.
+    commands = [controller.make_stop(query=False) for controller in controllers]
     try:
-        results = await asyncio.wait_for(
-            moteus.get_singleton_transport().cycle(commands), timeout=timeout_s)
+        async with asyncio.timeout(timeout_s):
+            await moteus.get_singleton_transport().cycle(commands)
+            await _verify_motor_modes(controllers, moteus.Mode.STOPPED)
     except TimeoutError as error:
         raise RuntimeError(
-            f'All-six motor stop batch timed out after {timeout_s} s; stop not confirmed.') from error
-    by_id = {result.id: result for result in results}
-    failures = []
-    for controller in controllers:
-        result = by_id.get(controller.id)
-        if (result is None or result.values.get(moteus.Register.FAULT) != 0
-                or result.values.get(moteus.Register.MODE) != moteus.Mode.STOPPED):
-            failures.append(f'Motor {controller.id}: missing healthy stopped-mode acknowledgement.')
-    if failures:
-        raise RuntimeError('Motor stop failed: ' + '; '.join(failures))
+            f'All-six motor stop batch/state verification timed out after {timeout_s} s; '
+            'stop not confirmed.') from error
+
 
 # [0] = Left Non Center
 # [1] = Left Center
@@ -187,6 +211,7 @@ async def update_wheel_velocities(
     *,
     max_output_rps: float,
     watchdog_timeout_s: float = DEFAULT_WATCHDOG_TIMEOUT_S,
+    timeout_s: float = 0.2,
 ):
     """Send six independent wheel velocities after validating the whole request.
 
@@ -199,7 +224,11 @@ async def update_wheel_velocities(
     either direction. Invalid requests raise ValueError before any command;
     speeds are never clipped. watchdog_timeout_s is the moteus backup timeout,
     in seconds; the ROS controller must also enforce fresh input and arming.
+    timeout_s bounds all six writes and any post-command mode verification;
+    the controller's existing outer I/O timeout remains in force as well.
     """
+    if not math.isfinite(timeout_s) or timeout_s <= 0:
+        raise ValueError('Motor update timeout must be finite and positive seconds.')
     wheel_names = (
         ('front_left', 'middle_left', 'rear_left'),
         ('front_right', 'middle_right', 'rear_right'),
@@ -238,11 +267,20 @@ async def update_wheel_velocities(
                 raise ValueError(f'{name} exceeds max_output_rps.')
             commands.append((controller, direction * output_rps))
 
-    for controller, output_rps in commands:
-        result = await controller.set_position(
-            position=math.nan, velocity=output_rps, query=True,
-            watchdog_timeout=watchdog_timeout_s)
-        if (result is None or result.values.get(moteus.Register.FAULT) != 0
-                or result.values.get(moteus.Register.MODE) != moteus.Mode.POSITION):
-            raise RuntimeError(
-                f'Motor {controller.id}: missing healthy position-mode acknowledgement: {result}')
+    try:
+        async with asyncio.timeout(timeout_s):
+            pending = []
+            for controller, output_rps in commands:
+                result = await controller.set_position(
+                    position=math.nan, velocity=output_rps, query=True,
+                    watchdog_timeout=watchdog_timeout_s)
+                mode = _motor_reply_mode(controller, result)
+                if mode != moteus.Mode.POSITION:
+                    pending.append(controller)
+            # Do not wait for each motor to enable separately. Verify transitions
+            # together after all six commands. Steady POSITION replies add no I/O.
+            if pending:
+                await _verify_motor_modes(pending, moteus.Mode.POSITION)
+    except TimeoutError as error:
+        raise RuntimeError(
+            f'Motor update/state verification timed out after {timeout_s} s.') from error

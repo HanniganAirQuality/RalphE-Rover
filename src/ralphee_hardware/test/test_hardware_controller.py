@@ -137,6 +137,20 @@ class TestHardwareController(unittest.TestCase):
         self.reference = math.pi / 6
         self.limit = 2.0
 
+    def load_motor_interface(self):
+        sdk = fake_module(
+            'moteus', Controller=object,
+            Register=SimpleNamespace(MODE='mode', FAULT='fault'),
+            Mode=SimpleNamespace(STOPPED=0, FAULT=1, POSITION=10, TIMEOUT=11))
+        spec = importlib.util.spec_from_file_location(
+            'motor_interface_under_test', self.source / 'ralphee_motor_interface.py')
+        interface = importlib.util.module_from_spec(spec)
+        with patch.dict(sys.modules, {
+                'moteus': sdk, 'usb': fake_module('usb'),
+                'numpy': fake_module('numpy', ndarray=list, array=lambda values: values)}):
+            spec.loader.exec_module(interface)
+        return interface, sdk
+
     def make_node(self, hardware=False, reference=None, limit=None):
         FakeNode.parameter_values = {
             'hardware_output_enabled': hardware,
@@ -579,60 +593,205 @@ class TestHardwareController(unittest.TestCase):
         self.assertFalse(node._motors_stopped)
         self.assertTrue(node._actuator_fault)
 
-    def test_motor_stop_batches_all_six_before_waiting_with_one_deadline(self):
-        sdk = fake_module(
-            'moteus', Controller=object,
-            Register=SimpleNamespace(MODE='mode', FAULT='fault'),
-            Mode=SimpleNamespace(STOPPED=0))
-        fake_numpy = fake_module('numpy', ndarray=list, array=lambda values: values)
-        spec = importlib.util.spec_from_file_location(
-            'motor_interface_under_test', self.source / 'ralphee_motor_interface.py')
-        interface = importlib.util.module_from_spec(spec)
-        with patch.dict(sys.modules, {'moteus': sdk, 'usb': fake_module('usb'),
-                                     'numpy': fake_numpy}):
-            spec.loader.exec_module(interface)
+    def test_motor_stop_batches_then_independently_verifies_with_one_deadline(self):
+        interface, sdk = self.load_motor_interface()
         ids = [2, 5, 3, 0, 4, 1]
         controllers = [SimpleNamespace(
-            id=motor_id, make_stop=Mock(return_value=SimpleNamespace(destination=motor_id)))
+            id=motor_id,
+            make_stop=Mock(return_value=SimpleNamespace(kind='stop', destination=motor_id)),
+            make_query=Mock(return_value=SimpleNamespace(kind='query', destination=motor_id)))
             for motor_id in ids]
         groups = [controllers[:3], controllers[3:]]
-        sent = []
-        replies = [SimpleNamespace(id=motor_id, values={'mode': 0, 'fault': 0})
-                   for motor_id in ids]
-        stalled = False
+        cycles = []
+        query_round = 0
+        scenario = 'delayed'
 
         async def cycle(commands):
-            sent.extend(command.destination for command in commands)
-            if stalled:
+            nonlocal query_round
+            kind = commands[0].kind
+            requested = [command.destination for command in commands]
+            cycles.append((kind, requested))
+            if kind == 'stop':
+                return []  # Write-only stop batch, not a post-command status read.
+            query_round += 1
+            if scenario == 'stalled':
                 await asyncio.Future()
-            return replies
+            results = []
+            for motor_id in requested:
+                if scenario == 'missing' and motor_id == 2:
+                    continue
+                mode = 10 if scenario == 'never_stopped' else 0
+                if scenario == 'delayed' and query_round == 1 and motor_id == 2:
+                    mode = 10  # Stop staged, previous POSITION still visible.
+                fault = 7 if scenario == 'fault' and motor_id == 5 else 0
+                results.append(SimpleNamespace(id=motor_id, values={'mode': mode, 'fault': fault}))
+            return results
 
         sdk.get_singleton_transport = lambda: SimpleNamespace(cycle=cycle)
 
         async def check():
-            nonlocal stalled
-            await interface.stop_motors(groups, timeout_s=0.01)
-            self.assertEqual(sent, ids)
+            nonlocal scenario
+            await interface.stop_motors(groups, timeout_s=0.1)
+            self.assertEqual(cycles, [('stop', ids), ('query', ids), ('query', [2])])
             for controller in controllers:
-                controller.make_stop.assert_called_once_with(query=True)
-            sent.clear()
-            replies.pop(0)  # First motor does not reply; all other stops still get sent.
-            with self.assertRaisesRegex(RuntimeError, 'Motor 2'):
-                await interface.stop_motors(groups, timeout_s=0.01)
-            self.assertEqual(sent, ids)
-            sent.clear()
-            stalled = True
-            # Use the real async wait and verify one deadline for the entire batch.
-            with patch.object(interface.asyncio, 'wait_for',
-                              wraps=asyncio.wait_for) as wait:
-                with self.assertRaisesRegex(RuntimeError, 'batch timed out'):
-                    await interface.stop_motors(groups, timeout_s=0.01)
-                self.assertEqual(wait.call_count, 1)
-                self.assertEqual(wait.call_args.kwargs['timeout'], 0.01)
-            self.assertEqual(sent, ids)
-            self.assertEqual(asyncio.all_tasks(), {asyncio.current_task()})
+                controller.make_stop.assert_called_once_with(query=False)
+
+            for scenario, message in (
+                    ('missing', 'Motor 2'), ('fault', 'Motor 5'),
+                    ('never_stopped', 'state verification timed out'),
+                    ('stalled', 'state verification timed out')):
+                with self.subTest(scenario=scenario):
+                    cycles.clear()
+                    with patch.object(interface.asyncio, 'timeout',
+                                      wraps=asyncio.timeout) as deadline:
+                        with self.assertRaisesRegex(RuntimeError, message):
+                            await interface.stop_motors(groups, timeout_s=0.1)
+                        self.assertEqual(deadline.call_count, 1)
+                        self.assertEqual(deadline.call_args.args, (0.1,))
+                    self.assertEqual(cycles[:2], [('stop', ids), ('query', ids)])
+                    self.assertTrue(all(kind == 'query' for kind, _ in cycles[1:]))
+                    self.assertEqual(asyncio.all_tasks(), {asyncio.current_task()})
 
         asyncio.run(check())
+
+    def test_motor_move_verifies_staged_modes_and_keeps_steady_updates_efficient(self):
+        interface, sdk = self.load_motor_interface()
+        ids = [2, 5, 3, 0, 4, 1]
+        sent = []
+        cycles = []
+        initial_modes = dict.fromkeys(ids, 0)
+        query_modes = [0, 2, 3, 4, 10]  # Previous mode, then firmware enabling/calibration.
+        scenario = 'healthy'
+        query_round = 0
+        stop_sent = False
+
+        def reply(motor_id, mode=10, fault=0):
+            return SimpleNamespace(id=motor_id, values={'mode': mode, 'fault': fault})
+
+        def controller(motor_id):
+            async def set_position(**kwargs):
+                sent.append((motor_id, kwargs))
+                if scenario == 'missing_immediate' and motor_id == 2:
+                    return None
+                fault = 9 if scenario == 'immediate_fault' and motor_id == 2 else 0
+                return reply(motor_id, initial_modes[motor_id], fault)
+
+            return SimpleNamespace(
+                id=motor_id, set_position=set_position,
+                make_stop=lambda **kwargs: SimpleNamespace(kind='stop', destination=motor_id),
+                make_query=lambda: SimpleNamespace(kind='query', destination=motor_id))
+
+        motors = [controller(motor_id) for motor_id in ids]
+        groups = [motors[:3], motors[3:]]
+        speeds = {name: (index + 1) * 0.05
+                  for index, name in enumerate(self.geometry.MEASURED_GEOMETRY.wheel_positions_m)}
+
+        async def cycle(commands):
+            nonlocal query_round, stop_sent
+            kind = commands[0].kind
+            requested = [command.destination for command in commands]
+            cycles.append((kind, requested))
+            if kind == 'stop':
+                stop_sent = True
+                return []
+            # The first follow-up read must come after ALL six movement writes.
+            self.assertEqual(len(sent), 6)
+            query_round += 1
+            if stop_sent:
+                return [reply(motor_id, 0) for motor_id in requested]
+            if scenario == 'stalled_query':
+                await asyncio.Future()
+            mode = query_modes[min(query_round - 1, len(query_modes) - 1)]
+            results = [reply(motor_id, mode) for motor_id in requested]
+            if scenario == 'missing_query':
+                return results[1:]
+            if scenario == 'query_fault':
+                results[0].values['fault'] = 7
+            if scenario == 'missing_fault':
+                del results[0].values['fault']
+            return results
+
+        sdk.get_singleton_transport = lambda: SimpleNamespace(cycle=cycle)
+
+        async def check():
+            nonlocal scenario, query_round, query_modes
+            await interface.update_wheel_velocities(
+                speeds, groups, max_output_rps=2.0, watchdog_timeout_s=0.4, timeout_s=0.2)
+            self.assertEqual([motor_id for motor_id, _ in sent], ids)
+            self.assertEqual(cycles, [('query', ids)] * 5)
+            wheel_order = ('front_left', 'middle_left', 'rear_left',
+                          'front_right', 'middle_right', 'rear_right')
+            for index, ((_, command), wheel) in enumerate(zip(sent, wheel_order)):
+                expected = speeds[wheel] / (math.tau * 0.125) * (1 if index < 3 else -1)
+                self.assertAlmostEqual(command['velocity'], expected)
+                self.assertTrue(math.isnan(command['position']))
+                self.assertTrue(command['query'])
+                self.assertEqual(command['watchdog_timeout'], 0.4)
+
+            sent.clear()
+            cycles.clear()
+            initial_modes.update(dict.fromkeys(ids, 10))
+            await interface.update_wheel_velocities(speeds, groups, max_output_rps=2.0)
+            self.assertEqual(len(sent), 6)
+            self.assertEqual(cycles, [])  # No added reads or sleeps in steady POSITION mode.
+
+            # Only a motor with an old/transitioning mode needs follow-up reads.
+            sent.clear()
+            initial_modes[2] = 0
+            query_modes = [10]
+            await interface.update_wheel_velocities(speeds, groups, max_output_rps=2.0)
+            self.assertEqual(cycles, [('query', [2])])
+
+            initial_modes.update(dict.fromkeys(ids, 0))
+            for scenario, modes, message in (
+                    ('immediate_fault', [10], 'FAULT=9'),
+                    ('missing_immediate', [10], 'missing'),
+                    ('missing_query', [10], 'missing'),
+                    ('query_fault', [10], 'FAULT=7'),
+                    ('missing_fault', [10], 'FAULT=None'),
+                    ('healthy', [1], 'MODE=1'), ('healthy', [11], 'MODE=11'),
+                    ('healthy', [0], 'timed out'), ('stalled_query', [10], 'timed out')):
+                with self.subTest(scenario=scenario, modes=modes):
+                    sent.clear()
+                    cycles.clear()
+                    query_round = 0
+                    query_modes = modes
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        await interface.update_wheel_velocities(
+                            speeds, groups, max_output_rps=2.0, timeout_s=0.1)
+                    self.assertEqual(asyncio.all_tasks(), {asyncio.current_task()})
+
+            # Invalid speed validation still precedes every write.
+            sent.clear()
+            for bad in (math.nan, math.inf, 100.0):
+                with self.assertRaises(ValueError):
+                    await interface.update_wheel_velocities(
+                        dict(speeds, rear_right=bad), groups, max_output_rps=2.0)
+            self.assertEqual(sent, [])
+
+        asyncio.run(check())
+
+        # A real interface verification error must still drive the unchanged ROS
+        # controller's stop/disarm/fault-latch path, with all device I/O faked.
+        sent.clear()
+        cycles.clear()
+        scenario = 'query_fault'
+        query_modes = [10]
+        query_round = 0
+        node = self.make_node(hardware=True)
+        self.arm(node)
+        node.motors = groups
+        node._update_wheel_velocities = interface.update_wheel_velocities
+        node._stop_motors = interface.stop_motors
+        node.controller_sub.callback(SimpleNamespace(data=[0.4, 0.0]))
+        self.assertTrue(node._actuator_fault)
+        self.assertFalse(node.armed)
+        self.assertTrue(node._motors_stopped)
+        self.assertEqual(cycles, [('query', ids), ('stop', ids), ('query', ids)])
+        count = len(sent)
+        self.arm(node, expected=False)
+        node.controller_sub.callback(SimpleNamespace(data=[0.4, 0.0]))
+        self.assertEqual(len(sent), count)
 
     def test_publisher_deadman_loss_neutral_and_mode_gating(self):
         source = self.source.parents[1] / 'ralphee_remote_control' / 'ralphee_remote_control'
