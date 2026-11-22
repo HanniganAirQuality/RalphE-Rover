@@ -58,7 +58,7 @@ async def stop_motors(controller_groups, *, timeout_s=0.2):
     # Keep the existing default fdcanusb transport and all-six stop batch.
     # A combined write/query can report the PREVIOUS mode, so request no state
     # in the stop frame and verify all six with subsequent query-only frames.
-    commands = [controller.make_stop(query=False) for controller in controllers]
+    commands = [controller.make_stop(query=True) for controller in controllers]
     try:
         async with asyncio.timeout(timeout_s):
             await moteus.get_singleton_transport().cycle(commands)
@@ -128,7 +128,7 @@ async def init_motors() -> list[list[moteus.Controller]]:
 
     # Reset motors incase of inpropper shutdown.
     print('[init_motors] set stop')
-    await stop_motors([left_controllers, right_controllers])
+    await stop_motors([left_controllers, right_controllers], timeout_s=2.0)
     print('[init_motors] ready!')
 
     # Return groups
